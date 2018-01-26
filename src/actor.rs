@@ -1,38 +1,37 @@
-use std;
 use std::time::Duration;
 use futures::{future, Future, Stream};
 use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_io::codec::{Encoder, Decoder};
+use tokio_io::codec::{Framed, Encoder, Decoder};
 
 use fut::ActorFuture;
-use message::Response;
 use arbiter::Arbiter;
 use address::ActorAddress;
 use envelope::ToEnvelope;
-use context::{Context, ActorFutureCell, ActorStreamCell};
-use framed::FramedContext;
-use utils::{TimerFunc, TimeoutWrapper};
+use handler::{Handler, Response, ResponseType};
+use context::Context;
+use contextitems::{ActorFutureItem, ActorMessageItem,
+                   ActorDelayedMessageItem, ActorStreamItem, ActorMessageStreamItem};
+use framed::{FramedCell, FramedWrapper};
+use utils::TimerFunc;
 
 
 #[allow(unused_variables)]
 /// Actors are objects which encapsulate state and behavior.
 ///
 /// Actors run within specific execution context
-/// [Context<A>](https://fafhrd91.github.io/actix/actix/struct.Context.html).
+/// [Context<A>](struct.Context.html).
 /// Context object is available only during execution. Each actor has separate
 /// execution context. Also execution context controls lifecycle of an actor.
 ///
 /// Actors communicate exclusively by exchanging messages. Sender actor can
-/// wait for response. Actors are not referenced dirrectly, but by
-/// non thread safe [Address<A>](https://fafhrd91.github.io/actix/actix/struct.Address.html)
-/// or thread safe address
-/// [`SyncAddress<A>`](https://fafhrd91.github.io/actix/actix/struct.SyncAddress.html)
+/// wait for response. Actors are not referenced directly, but by
+/// non thread safe [`LocalAddress<A>`](struct.LocalAddress.html) or thread safe address
+/// [`Address<A>`](struct.Address.html)
 /// To be able to handle specific message actor has to provide
-/// [`Handler<M>`](
-/// file:///Users/nikki/personal/ctx/target/doc/actix/trait.Handler.html)
+/// [`Handler<M>`](trait.Handler.html)
 /// implementation for this message. All messages are statically typed. Message could be
-/// handled in asynchronous fasion. Actor can spawn other actors or add futures or
-/// streams to execution context. Actor trait provides several method that allows
+/// handled in asynchronous fashion. Actor can spawn other actors or add futures or
+/// streams to execution context. Actor trait provides several methods that allow
 /// to control actor lifecycle.
 ///
 /// # Actor lifecycle
@@ -43,7 +42,7 @@ use utils::{TimerFunc, TimeoutWrapper};
 ///
 /// ## Running
 ///
-/// Aftre Actor's method `started` get called, actor transitiones to `Running` state.
+/// After Actor's method `started` get called, actor transitions to `Running` state.
 /// Actor can stay in `running` state indefinitely long.
 ///
 /// ## Stopping
@@ -56,6 +55,11 @@ use utils::{TimerFunc, TimeoutWrapper};
 ///
 /// Actor could restore from `stopping` state to `running` state by creating new
 /// address or adding evented object, like future or stream, in `Actor::stopping` method.
+///
+/// If actor changed state to a `stopping` state because of `Context::stop()` get called
+/// then context immediately stops processing incoming messages and calls
+/// `Actor::stopping()` method. If actor does not restore back to a `running` state, all
+/// unprocessed messages get dropped.
 ///
 /// ## Stopped
 ///
@@ -73,9 +77,12 @@ pub trait Actor: Sized + 'static {
     /// Method is called after an actor is in `Actor::Stopping` state. There could be several
     /// reasons for stopping. `Context::stop` get called by the actor itself.
     /// All addresses to current actor get dropped and no more evented objects
-    /// left in the context. Actor could restore from stopping state to running state
-    /// by creating new address or adding future or stream to current content.
-    fn stopping(&mut self, ctx: &mut Self::Context) {}
+    /// left in the context.
+    ///
+    /// Actor could restore from stopping state by returning `false` value.
+    fn stopping(&mut self, ctx: &mut Self::Context) -> bool {
+        true
+    }
 
     /// Method is called after an actor is stopped, it can be used to perform
     /// any needed cleanup work or spawning more actors. This is final state,
@@ -97,12 +104,12 @@ pub trait Actor: Sized + 'static {
     ///     type Context = Context<Self>;
     /// }
     ///
-    /// let addr: Address<_> = MyActor.start();
+    /// let addr: LocalAddress<_> = MyActor.start();
     /// ```
     fn start<Addr>(self) -> Addr
         where Self: Actor<Context=Context<Self>> + ActorAddress<Self, Addr>
     {
-        let mut ctx = Context::new(self);
+        let mut ctx = Context::new(Some(self));
         let addr =  <Self as ActorAddress<Self, Addr>>::get(&mut ctx);
         ctx.run(Arbiter::handle());
         addr
@@ -130,7 +137,7 @@ pub trait Actor: Sized + 'static {
     ///     type Context = Context<Self>;
     /// }
     ///
-    /// let addr: Address<_> = MyActor::create(|ctx: &mut Context<MyActor>| {
+    /// let addr: LocalAddress<_> = MyActor::create(|ctx: &mut Context<MyActor>| {
     ///     MyActor{val: 10}
     /// });
     /// ```
@@ -138,13 +145,12 @@ pub trait Actor: Sized + 'static {
         where Self: Actor<Context=Context<Self>> + ActorAddress<Self, Addr>,
               F: FnOnce(&mut Context<Self>) -> Self + 'static
     {
-        let mut ctx = Context::new(unsafe{std::mem::uninitialized()});
+        let mut ctx = Context::new(None);
         let addr =  <Self as ActorAddress<Self, Addr>>::get(&mut ctx);
 
         Arbiter::handle().spawn_fn(move || {
             let act = f(&mut ctx);
-            let old = ctx.replace_actor(act);
-            std::mem::forget(old);
+            ctx.set_actor(act);
             ctx.run(Arbiter::handle());
             future::ok(())
         });
@@ -152,69 +158,59 @@ pub trait Actor: Sized + 'static {
     }
 
     /// Create static response.
-    fn reply<M>(val: M::Item) -> Response<Self, M> where M: ResponseType {
+    fn reply<M>(val: Result<M::Item, M::Error>) -> Response<Self, M> where M: ResponseType {
         Response::reply(val)
     }
 
     /// Create async response process.
     fn async_reply<T, M>(fut: T) -> Response<Self, M>
         where M: ResponseType,
-              T: ActorFuture<Item=M::Item, Error=M::Error, Actor=Self> + Sized + 'static
-    {
+              T: ActorFuture<Item=M::Item, Error=M::Error, Actor=Self> + Sized + 'static {
         Response::async_reply(fut)
-    }
-
-    /// Create unit response, for case when `ResponseType::Item = ()`
-    fn empty<M>() -> Response<Self, M> where M: ResponseType<Item=()> {
-        Response::empty()
-    }
-
-    /// Create error response
-    fn reply_error<M>(err: M::Error) -> Response<Self, M> where M: ResponseType {
-        Response::error(err)
     }
 }
 
 /// Actor trait that allows to handle `tokio_io::codec::Framed` objects.
 #[allow(unused_variables)]
-pub trait FramedActor: Actor {
-    /// Io type
-    type Io: AsyncRead + AsyncWrite;
-    /// Codec type
-    type Codec: Encoder + Decoder;
+pub trait FramedActor<Io, Codec>: Actor
+    where Io: AsyncRead + AsyncWrite + 'static,
+          Codec: Encoder + Decoder + 'static,
+{
+    /// This method is called for every decoded message from framed object.
+    fn handle(&mut self,
+              msg: Result<<Codec as Decoder>::Item, <Codec as Decoder>::Error>,
+              ctx: &mut Self::Context);
 
-    /// Method is called on sink error. By default it does nothing.
-    fn error(&mut self, err: <Self::Codec as Encoder>::Error, ctx: &mut Self::Context) {}
+    /// This method is called when framed object get closed.
+    ///
+    /// `error` indicates if framed get closed because of error.
+    fn closed(&mut self, error: Option<<Codec as Encoder>::Error>,
+              ctx: &mut Self::Context) {}
 
-    /// Start new actor, returns address of this actor.
-    fn framed<Addr>(self, io: Self::Io, codec: Self::Codec) -> Addr
-        where Self: Actor<Context=FramedContext<Self>> + ActorAddress<Self, Addr>,
-              Self: StreamHandler<<<Self as FramedActor>::Codec as Decoder>::Item,
-                                  <<Self as FramedActor>::Codec as Decoder>::Error>,
-            <<Self as FramedActor>::Codec as Decoder>::Item: ResponseType,
+    /// Add framed object to current context and return
+    /// wrapper for write part of the framed object.
+    fn add_framed(&self, framed: Framed<Io, Codec>, ctx: &mut Self::Context)
+                  -> FramedCell<Io, Codec>
+        where Self::Context: AsyncContext<Self>
     {
-        let mut ctx = FramedContext::new(self, io, codec);
-        let addr =  <Self as ActorAddress<Self, Addr>>::get(&mut ctx);
-        ctx.run(Arbiter::handle());
-        addr
+        let (wrp, cell) = FramedWrapper::new(framed);
+        ctx.spawn(wrp);
+        cell
     }
 
-    /// This function starts new actor, returns address of this actor.
-    /// Actor is created by factory function.
-    fn create_framed<Addr, F>(io: Self::Io, codec: Self::Codec, f: F) -> Addr
-        where Self: Actor<Context=FramedContext<Self>> + ActorAddress<Self, Addr>,
-              Self: StreamHandler<<<Self as FramedActor>::Codec as Decoder>::Item,
-                                  <<Self as FramedActor>::Codec as Decoder>::Error>,
-            <<Self as FramedActor>::Codec as Decoder>::Item: ResponseType,
-              F: FnOnce(&mut FramedContext<Self>) -> Self + 'static
+    /// Start new asynchronous actor, returns address of newly created actor.
+    fn create_with<Addr, F>(framed: Framed<Io, Codec>, f: F) -> Addr
+        where Self: Actor<Context=Context<Self>> + ActorAddress<Self, Addr>,
+              F: FnOnce(&mut Context<Self>, FramedCell<Io, Codec>) -> Self + 'static
     {
-        let mut ctx = FramedContext::new(unsafe{std::mem::uninitialized()}, io, codec);
+        let mut ctx = Context::new(None);
         let addr =  <Self as ActorAddress<Self, Addr>>::get(&mut ctx);
+        let (wrp, cell) = FramedWrapper::new(framed);
+        ctx.spawn(wrp);
 
         Arbiter::handle().spawn_fn(move || {
-            let act = f(&mut ctx);
-            let old = ctx.replace_actor(act);
-            std::mem::forget(old);
+            let act = f(&mut ctx, cell);
+            ctx.set_actor(act);
             ctx.run(Arbiter::handle());
             future::ok(())
         });
@@ -226,59 +222,17 @@ pub trait FramedActor: Actor {
 #[allow(unused_variables)]
 /// Actors with ability to restart after failure
 ///
-/// Supervised actors can be managed by
-/// [Supervisor](https://fafhrd91.github.io/actix/actix/struct.Supervisor.html)
-/// Livecycle events are extended with `restarting` state for supervised actors.
-/// If actor failes supervisor create new execution context and restart actor.
+/// Supervised actors can be managed by [Supervisor](struct.Supervisor.html).
+/// Lifecycle events are extended with `restarting` method.
+/// If actor fails, supervisor creates new execution context and restarts actor.
 /// `restarting` method is called during restart. After call to this method
 /// Actor execute state changes to `Started` and normal lifecycle process starts.
+///
+/// `restarting` method get called with newly constructed `Context` object.
 pub trait Supervised: Actor {
 
     /// Method called when supervisor restarting failed actor
     fn restarting(&mut self, ctx: &mut <Self as Actor>::Context) {}
-}
-
-/// Message handler
-///
-/// `Handler` implementation is a general way how to handle
-/// incoming messages, streams, futures.
-///
-/// `M` is a message which can be handled by the actor.
-/// `E` is an optional error type, if message handler is used for handling
-/// Future or Stream results, then `E` type has to be set to correspondent `Error` type.
-#[allow(unused_variables)]
-pub trait Handler<M, E=()> where Self: Actor, M: ResponseType
-{
-    /// Method is called for every message received by this Actor
-    fn handle(&mut self, msg: M, ctx: &mut Self::Context) -> Response<Self, M>;
-
-    /// Method is called on error. By default it does nothing.
-    fn error(&mut self, err: E, ctx: &mut Self::Context) {}
-}
-
-/// Message response type
-pub trait ResponseType {
-
-    /// The type of value that this message will resolved with if it is successful.
-    type Item;
-
-    /// The type of error that this message will resolve with if it fails in a normal fashion.
-    type Error;
-}
-
-/// Stream handler
-///
-/// `StreamHandler` is an extension of a `Handler` with stream specific methods.
-#[allow(unused_variables)]
-pub trait StreamHandler<M, E=()>: Handler<M, E>
-    where Self: Actor,
-          M: ResponseType,
-{
-    /// Method is called when stream get polled first time.
-    fn started(&mut self, ctx: &mut Self::Context) {}
-
-    /// Method is called when stream finishes, even if stream finishes with error.
-    fn finished(&mut self, ctx: &mut Self::Context) {}
 }
 
 /// Actor execution state
@@ -294,14 +248,20 @@ pub enum ActorState {
     Stopped,
 }
 
+impl ActorState {
+    pub fn alive(&self) -> bool {
+        *self == ActorState::Started || *self == ActorState::Running
+    }
+}
+
 /// Actor execution context
 ///
 /// Each actor runs within specific execution context. `Actor::Context` defines
-/// context. Execution context defines type of execution, actor communition channels
+/// context. Execution context defines type of execution, actor communication channels
 /// (message handling).
 pub trait ActorContext: Sized {
 
-    /// Gracefuly stop actor execution
+    /// Immediately stop processing incoming messages and switch to a `stopping` state
     fn stop(&mut self);
 
     /// Terminate actor execution
@@ -309,11 +269,6 @@ pub trait ActorContext: Sized {
 
     /// Actor execution state
     fn state(&self) -> ActorState;
-
-    /// Check if execution context is alive
-    fn alive(&self) -> bool {
-        self.state() == ActorState::Stopped
-    }
 }
 
 /// Asynchronous execution context
@@ -326,6 +281,8 @@ pub trait AsyncContext<A>: ActorContext + ToEnvelope<A> where A: Actor<Context=S
 
     /// Spawn async future into context. Returns handle of the item,
     /// could be used for cancelling execution.
+    ///
+    /// All futures cancel during actor stopping stage.
     fn spawn<F>(&mut self, fut: F) -> SpawnHandle
         where F: ActorFuture<Item=(), Error=(), Actor=A> + 'static;
 
@@ -334,38 +291,32 @@ pub trait AsyncContext<A>: ActorContext + ToEnvelope<A> where A: Actor<Context=S
     fn wait<F>(&mut self, fut: F)
         where F: ActorFuture<Item=(), Error=(), Actor=A> + 'static;
 
+    /// Check if context is paused (waiting for future completion or stopping)
+    fn waiting(&self) -> bool;
+
     /// Cancel future. idx is a value returned by `spawn` method.
     fn cancel_future(&mut self, handle: SpawnHandle) -> bool;
-
-    #[doc(hidden)]
-    /// Cancel future during actor stopping state.
-    fn cancel_future_on_stop(&mut self, handle: SpawnHandle);
 
     /// This method allow to handle Future in similar way as normal actor messages.
     ///
     /// ```rust
-    /// extern crate actix;
-    ///
-    /// use std::time::Duration;
+    /// # #[macro_use] extern crate actix;
+    /// # extern crate futures;
+    /// use std::io;
     /// use actix::prelude::*;
+    /// use futures::future;
     ///
-    /// // Message
+    /// #[derive(Message)]
     /// struct Ping;
-    ///
-    /// impl ResponseType for Ping {
-    ///     type Item = ();
-    ///     type Error = ();
-    /// }
     ///
     /// struct MyActor;
     ///
-    /// impl Handler<Ping, std::io::Error> for MyActor {
-    ///     fn error(&mut self, err: std::io::Error, ctx: &mut Context<MyActor>) {
-    ///         println!("Error: {}", err);
-    ///     }
-    ///     fn handle(&mut self, msg: Ping, ctx: &mut Context<MyActor>) -> Response<Self, Ping> {
+    /// impl Handler<Result<Ping, io::Error>> for MyActor {
+    ///     type Result = ();
+    ///
+    ///     fn handle(&mut self, msg: Result<Ping, io::Error>, ctx: &mut Context<MyActor>) {
     ///         println!("PING");
-    ///         Self::empty()
+    /// #       Arbiter::system().send(actix::msgs::SystemExit(0));
     ///     }
     /// }
     ///
@@ -374,64 +325,160 @@ pub trait AsyncContext<A>: ActorContext + ToEnvelope<A> where A: Actor<Context=S
     ///
     ///    fn started(&mut self, ctx: &mut Context<Self>) {
     ///        // send `Ping` to self.
-    ///        ctx.notify(Ping, Duration::new(0, 1000));
+    ///        ctx.add_future(future::result::<Ping, io::Error>(Ok(Ping)));
     ///    }
     /// }
-    /// fn main() {}
+    /// # fn main() {
+    /// #    let sys = System::new("example");
+    /// #    let addr: LocalAddress<_> = MyActor.start();
+    /// #    sys.run();
+    /// # }
     /// ```
     fn add_future<F>(&mut self, fut: F)
         where F: Future + 'static,
               F::Item: ResponseType,
-              A: Handler<F::Item, F::Error>
+              A: Handler<Result<F::Item, F::Error>>
     {
         if self.state() == ActorState::Stopped {
             error!("Context::add_future called for stopped actor.");
         } else {
-            self.spawn(ActorFutureCell::new(fut));
+            self.spawn(ActorFutureItem::new(fut));
         }
     }
 
     /// This method is similar to `add_future` but works with streams.
     ///
     /// Information to consider. Actor wont receive next item from a stream
-    /// until `Response` future resolves to result. `Self::reply` and
-    /// `Self::reply_error` resolves immediately.
+    /// until `Response` future resolves to a result. `Self::reply` resolves immediately.
+    ///
+    /// This method is similar to `add_stream` but it skips result error.
+    ///
+    /// ```rust
+    /// # #[macro_use] extern crate actix;
+    /// # extern crate futures;
+    /// # use std::io;
+    /// use actix::prelude::*;
+    /// use futures::stream::once;
+    ///
+    /// #[derive(Message)]
+    /// struct Ping;
+    ///
+    /// struct MyActor;
+    ///
+    /// impl Handler<Result<Ping, io::Error>> for MyActor {
+    ///     type Result = ();
+    ///
+    ///     fn handle(&mut self, msg: Result<Ping, io::Error>, ctx: &mut Context<MyActor>) {
+    ///         println!("PING");
+    /// #       Arbiter::system().send(actix::msgs::SystemExit(0));
+    ///     }
+    /// }
+    ///
+    /// impl Actor for MyActor {
+    ///    type Context = Context<Self>;
+    ///
+    ///    fn started(&mut self, ctx: &mut Context<Self>) {
+    ///        // add stream
+    ///        ctx.add_stream(once::<Ping, io::Error>(Ok(Ping)));
+    ///    }
+    /// }
+    /// # fn main() {
+    /// #    let sys = System::new("example");
+    /// #    let addr: LocalAddress<_> = MyActor.start();
+    /// #    sys.run();
+    /// # }
+    /// ```
     fn add_stream<S>(&mut self, fut: S)
         where S: Stream + 'static,
               S::Item: ResponseType,
-              A: Handler<S::Item, S::Error> + StreamHandler<S::Item, S::Error>
+              A: Handler<Result<S::Item, S::Error>>
     {
         if self.state() == ActorState::Stopped {
             error!("Context::add_stream called for stopped actor.");
         } else {
-            self.spawn(ActorStreamCell::new(fut));
+            self.spawn(ActorStreamItem::new(fut));
+        }
+    }
+
+    /// This method is similar to `add_stream` but it skips result error.
+    ///
+    /// ```rust
+    /// # #[macro_use] extern crate actix;
+    /// # extern crate futures;
+    /// use actix::prelude::*;
+    /// use futures::stream::once;
+    ///
+    /// #[derive(Message)]
+    /// struct Ping;
+    ///
+    /// struct MyActor;
+    ///
+    /// impl Handler<Ping> for MyActor {
+    ///     type Result = ();
+    ///
+    ///     fn handle(&mut self, msg: Ping, ctx: &mut Context<MyActor>) {
+    ///         println!("PING");
+    /// #       Arbiter::system().send(actix::msgs::SystemExit(0));
+    ///     }
+    /// }
+    ///
+    /// impl Actor for MyActor {
+    ///    type Context = Context<Self>;
+    ///
+    ///    fn started(&mut self, ctx: &mut Context<Self>) {
+    ///        // add messages stream
+    ///        ctx.add_message_stream(once(Ok(Ping)));
+    ///    }
+    /// }
+    /// # fn main() {
+    /// #    let sys = System::new("example");
+    /// #    let addr: LocalAddress<_> = MyActor.start();
+    /// #    sys.run();
+    /// # }
+    /// ```
+    fn add_message_stream<S>(&mut self, fut: S)
+        where S: Stream<Error=()> + 'static,
+              S::Item: ResponseType,
+              A: Handler<S::Item>
+    {
+        if self.state() == ActorState::Stopped {
+            error!("Context::add_message_stream called for stopped actor.");
+        } else {
+            self.spawn(ActorMessageStreamItem::new(fut));
+        }
+    }
+
+    /// Send message `msg` to self.
+    fn notify<M>(&mut self, msg: M)
+        where A: Handler<M>, M: ResponseType + 'static
+    {
+        if self.state() == ActorState::Stopped {
+            error!("Context::add_timeout called for stopped actor.");
+        } else {
+            self.spawn(ActorMessageItem::new(msg));
         }
     }
 
     /// Send message `msg` to self after specified period of time. Returns spawn handle
-    /// which could be used for cancelation. Notification get cancelled
+    /// which could be used for cancellation. Notification get cancelled
     /// if context's stop method get called.
-    fn notify<M, E>(&mut self, msg: M, after: Duration) -> SpawnHandle
-        where A: Handler<M, E>, M: ResponseType + 'static, E: 'static
+    fn notify_later<M>(&mut self, msg: M, after: Duration) -> SpawnHandle
+        where A: Handler<M>, M: ResponseType + 'static
     {
         if self.state() == ActorState::Stopped {
             error!("Context::add_timeout called for stopped actor.");
             SpawnHandle::default()
         } else {
-            let h = self.spawn(ActorFutureCell::new(TimeoutWrapper::new(msg, after)));
-            self.cancel_future_on_stop(h);
-            h
+            self.spawn(ActorDelayedMessageItem::new(msg, after))
         }
     }
 
-    /// Execute closure after specified period of time within same Actor and Context
+    /// Execute closure after specified period of time within same Actor and Context.
     /// Execution get cancelled if context's stop method get called.
     fn run_later<F>(&mut self, dur: Duration, f: F) -> SpawnHandle
         where F: FnOnce(&mut A, &mut A::Context) + 'static
     {
-        let h = self.spawn(TimerFunc::new(dur, f));
-        self.cancel_future_on_stop(h);
-        h
+        self.spawn(TimerFunc::new(dur, f))
     }
 }
 

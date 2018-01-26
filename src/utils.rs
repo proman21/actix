@@ -1,5 +1,4 @@
 use std::time::Duration;
-use std::marker::PhantomData;
 use futures::{Async, Future, Poll};
 use futures::unsync::oneshot;
 use tokio_core::reactor::Timeout;
@@ -8,8 +7,6 @@ use fut::ActorFuture;
 use actor::Actor;
 use arbiter::Arbiter;
 
-
-#[doc(hidden)]
 pub struct Condition<T> where T: Clone {
     waiters: Vec<oneshot::Sender<T>>,
 }
@@ -35,34 +32,21 @@ impl<T> Default for Condition<T> where T: Clone {
     }
 }
 
-pub(crate) struct TimeoutWrapper<M, E> {
-    msg: Option<M>,
-    err: PhantomData<E>,
-    timeout: Timeout,
-}
+pub struct Drain(oneshot::Receiver<()>);
 
-impl<M, E> TimeoutWrapper<M, E> {
-    pub fn new(msg: M, timeout: Duration) -> TimeoutWrapper<M, E> {
-        TimeoutWrapper{
-            msg: Some(msg),
-            err: PhantomData,
-            timeout: Timeout::new(timeout, Arbiter::handle()).unwrap()}
+impl Drain {
+    pub(crate) fn new(rx: oneshot::Receiver<()>) -> Drain {
+        Drain(rx)
     }
 }
 
-
 #[doc(hidden)]
-impl<M, E> Future for TimeoutWrapper<M, E>
-{
-    type Item = M;
-    type Error = E;
+impl Future for Drain {
+    type Item = ();
+    type Error = ();
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.timeout.poll() {
-            Ok(Async::Ready(_)) => Ok(Async::Ready(self.msg.take().unwrap())),
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(_) => unreachable!(),
-        }
+        self.0.poll().map_err(|_| ())
     }
 }
 

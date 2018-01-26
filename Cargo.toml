@@ -1,6 +1,6 @@
 [package]
 name = "actix"
-version = "0.3.3"
+version = "0.5.0"
 authors = ["Nikolay Kim <fafhrd91@gmail.com>"]
 description = "Actor framework for Rust"
 readme = "README.md"
@@ -9,7 +9,7 @@ homepage = "https://github.com/actix/actix/"
 repository = "https://github.com/actix/actix.git"
 documentation = "https://docs.rs/actix/"
 categories = ["network-programming", "asynchronous"]
-license = "Apache-2.0"
+license = "MIT/Apache-2.0"
 exclude = [".gitignore", ".travis.yml", ".cargo/config", "appveyor.yml"]
 build = "build.rs"
 
@@ -25,30 +25,30 @@ path = "src/lib.rs"
 [features]
 default = []
 
-# Include process signal support, on by default
-signal = ["tokio-signal", "libc"]
-
-# Include dns resolver actor
-dns = ["libc"]
-
 [workspace]
 members = ["examples/chat"]
 
 [dependencies]
-# tokio
+actix_derive = "0.1"
+
+# io
+bytes = "0.4"
 futures = "0.1"
 tokio-io = "0.1"
 tokio-core = "0.1"
+tokio-signal = "0.1"
 
 # other
-log = "0.3"
-crossbeam = "0.3"
-libc = { version = "0.2", optional = true }
+log = "0.4"
+failure = "0.1.1"
+bitflags = "1.0"
+smallvec = "0.6"
+crossbeam-channel = "0.1"
+libc = { version = "0.2" }
 uuid = { version = "0.5", features = ["v4"] }
 
-[dependencies.tokio-signal]
-version = "0.1"
-optional = true
+# dns
+trust-dns-resolver = "0.7"
 
 [dev-dependencies]
 skeptic = "0.13"

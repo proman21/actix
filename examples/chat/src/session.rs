@@ -17,7 +17,7 @@ impl ResponseType for Message {
     type Error = ();
 }
 
-/// `ChatSession` actor is responsible for tcp peer communitions.
+/// `ChatSession` actor is responsible for tcp peer communications.
 pub struct ChatSession {
     /// unique session id
     id: usize,
@@ -27,25 +27,14 @@ pub struct ChatSession {
     hb: Instant,
     /// joined room
     room: String,
+    /// Framed wrapper
+    framed: FramedCell<TcpStream, ChatCodec>,
 }
 
 impl Actor for ChatSession {
-    /// For tcp communication we are going to use `FramedContext`.
-    /// It is convinient wrapper around `Framed` object from `tokio_io`
-    type Context = FramedContext<Self>;
-}
+    type Context = actix::Context<Self>;
 
-/// To use `FramedContext` we have to define Io type and Codec
-impl FramedActor for ChatSession {
-    type Io = TcpStream;
-    type Codec= ChatCodec;
-}
-
-/// Also `FramedContext` requires Actor which is able to handle stream
-/// of `<Codec as Decoder>::Item` items.
-impl StreamHandler<ChatRequest, io::Error> for ChatSession {
-
-    fn started(&mut self, ctx: &mut FramedContext<Self>) {
+    fn started(&mut self, ctx: &mut Self::Context) {
         // we'll start heartbeat process on session start.
         self.hb(ctx);
 
@@ -58,93 +47,87 @@ impl StreamHandler<ChatRequest, io::Error> for ChatSession {
                 // something is wrong with chat server
                 _ => ctx.stop(),
             }
-            fut::ok(())
+            actix::fut::ok(())
         }).wait(ctx);
     }
 
-    fn finished(&mut self, ctx: &mut FramedContext<Self>) {
+    fn stopping(&mut self, _: &mut Self::Context) -> bool {
         // notify chat server
         self.addr.send(server::Disconnect{id: self.id});
-
-        ctx.stop()
+        true
     }
 }
 
-impl Handler<ChatRequest, io::Error> for ChatSession {
-
-    /// We'll stop chat session actor on any error, high likely it is just
-    /// termination of the tcp stream.
-    fn error(&mut self, _: io::Error, ctx: &mut FramedContext<Self>) {
-        ctx.stop()
-    }
+/// To use `Framed` we have to implement FramedActor trait
+impl actix::FramedActor<TcpStream, ChatCodec> for ChatSession {
 
     /// This is main event loop for client requests
-    fn handle(&mut self, msg: ChatRequest, ctx: &mut FramedContext<Self>)
-              -> Response<Self, ChatRequest>
-    {
+    fn handle(&mut self, msg: io::Result<ChatRequest>, ctx: &mut Self::Context) {
         match msg {
-            ChatRequest::List => {
-                // Send ListRooms message to chat server and wait for response
-                println!("List rooms");
-                self.addr.call(self, server::ListRooms).then(|res, _, ctx| {
-                    match res {
-                        Ok(Ok(rooms)) => {
-                            let _ = ctx.send(ChatResponse::Rooms(rooms));
-                        },
-                        _ => println!("Something is wrong"),
-                    }
-                    fut::ok(())
-                }).wait(ctx)
-                // .wait(ctx) pauses all events in context,
-                // so actor wont receive any new messages until it get list of rooms back
-            },
-            ChatRequest::Join(name) => {
-                println!("Join to room: {}", name);
-                self.room = name.clone();
-                self.addr.send(server::Join{id: self.id, name: name.clone()});
-                let _ = ctx.send(ChatResponse::Joined(name));
-            },
-            ChatRequest::Message(message) => {
-                // send message to chat server
-                println!("Peer message: {}", message);
-                self.addr.send(
-                    server::Message{id: self.id,
-                                    msg: message, room:
-                                    self.room.clone()})
+            Err(_) => ctx.stop(),
+            Ok(msg) => match msg {
+                ChatRequest::List => {
+                    // Send ListRooms message to chat server and wait for response
+                    println!("List rooms");
+                    self.addr.call(self, server::ListRooms).then(|res, act, _| {
+                        match res {
+                            Ok(Ok(rooms)) =>
+                                act.framed.send(ChatResponse::Rooms(rooms)),
+                            _ => println!("Something is wrong"),
+                        }
+                        actix::fut::ok(())
+                    }).wait(ctx)
+                    // .wait(ctx) pauses all events in context,
+                    // so actor wont receive any new messages until it get list of rooms back
+                },
+                ChatRequest::Join(name) => {
+                    println!("Join to room: {}", name);
+                    self.room = name.clone();
+                    self.addr.send(server::Join{id: self.id, name: name.clone()});
+                    self.framed.send(ChatResponse::Joined(name));
+                },
+                ChatRequest::Message(message) => {
+                    // send message to chat server
+                    println!("Peer message: {}", message);
+                    self.addr.send(
+                        server::Message{id: self.id,
+                                        msg: message, room:
+                                        self.room.clone()})
+                }
+                // we update heartbeat time on ping from peer
+                ChatRequest::Ping =>
+                    self.hb = Instant::now(),
             }
-            // we update heartbeat time on ping from peer
-            ChatRequest::Ping =>
-                self.hb = Instant::now(),
         }
-
-        Self::empty()
     }
 }
 
 /// Handler for Message, chat server sends this message, we just send string to peer
 impl Handler<Message> for ChatSession {
+    type Result = ();
 
-    fn handle(&mut self, msg: Message, ctx: &mut FramedContext<Self>)
-              -> Response<Self, Message>
-    {
+    fn handle(&mut self, msg: Message, _: &mut Self::Context) {
         // send message to peer
-        let _ = ctx.send(ChatResponse::Message(msg.0));
-
-        Self::empty()
+        self.framed.send(ChatResponse::Message(msg.0));
     }
 }
 
 /// Helper methods
 impl ChatSession {
 
-    pub fn new(addr: Address<ChatServer>) -> ChatSession {
-        ChatSession {id: 0, addr: addr, hb: Instant::now(), room: "Main".to_owned()}
+    pub fn new(addr: Address<ChatServer>,
+               framed: FramedCell<TcpStream, ChatCodec>) -> ChatSession {
+        ChatSession {id: 0,
+                     addr: addr,
+                     hb: Instant::now(),
+                     room: "Main".to_owned(),
+                     framed: framed}
     }
     
     /// helper method that sends ping to client every second.
     ///
     /// also this method check heartbeats from client
-    fn hb(&self, ctx: &mut FramedContext<Self>) {
+    fn hb(&self, ctx: &mut actix::Context<Self>) {
         ctx.run_later(Duration::new(1, 0), |act, ctx| {
             // check client heartbeats
             if Instant::now().duration_since(act.hb) > Duration::new(10, 0) {
@@ -158,10 +141,8 @@ impl ChatSession {
                 ctx.stop();
             }
 
-            if ctx.send(ChatResponse::Ping).is_ok() {
-                // if we can not send message to sink, sink is closed (disconnected)
-                act.hb(ctx);
-            }
+            act.framed.send(ChatResponse::Ping);
+            act.hb(ctx);
         });
     }
 }

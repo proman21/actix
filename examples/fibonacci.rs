@@ -1,6 +1,6 @@
 //! Example of sync actor. It can be used for cpu bound tasks. Only one sync actor
-//! runs within arbiter's thread. Sync actor process one message at a time.
-//! Sync arbiter can start mutiple threads with separate instance of actor in each.
+//! runs within arbiter's thread. Sync actor processes one message at a time.
+//! Sync arbiter can start multiple threads with separate instance of actor in each.
 
 extern crate actix;
 extern crate futures;
@@ -22,11 +22,13 @@ impl Actor for SyncActor {
 }
 
 impl Handler<Fibonacci> for SyncActor {
-    fn handle(&mut self, msg: Fibonacci, _: &mut Self::Context) -> Response<Self, Fibonacci> {
+    type Result = MessageResult<Fibonacci>;
+
+    fn handle(&mut self, msg: Fibonacci, _: &mut Self::Context) -> Self::Result {
         if msg.0 == 0 {
-            Self::reply_error(())
+            Err(())
         } else if msg.0 == 1 {
-            Self::reply(1)
+            Ok(1)
         } else {
             let mut i = 0;
             let mut sum = 0;
@@ -38,7 +40,7 @@ impl Handler<Fibonacci> for SyncActor {
                 curr = sum;
                 i += 1;
             }
-            Self::reply(sum)
+            Ok(sum)
         }
    }
 }
@@ -55,7 +57,7 @@ fn main() {
     }
 
     Arbiter::handle().spawn_fn(|| {
-        Arbiter::system().send(msgs::SystemExit(0));
+        Arbiter::system().send(actix::msgs::SystemExit(0));
         futures::future::result(Ok(()))
     });
 

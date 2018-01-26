@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use actor::{Actor, Supervised};
 use arbiter::Arbiter;
-use address::{Address, SyncAddress};
+use address::{Address, LocalAddress};
 use context::Context;
 use supervisor::Supervisor;
 
@@ -19,15 +19,11 @@ use supervisor::Supervisor;
 /// # Example
 ///
 /// ```rust
-/// extern crate actix;
+/// # #[macro_use] extern crate actix;
 /// use actix::prelude::*;
 ///
+/// #[derive(Message)]
 /// struct Ping;
-///
-/// impl ResponseType for Ping {
-///    type Item = ();
-///    type Error = ();
-/// }
 ///
 /// #[derive(Default)]
 /// struct MyActor1;
@@ -35,20 +31,20 @@ use supervisor::Supervisor;
 /// impl Actor for MyActor1 {
 ///     type Context = Context<Self>;
 /// }
-/// impl Supervised for MyActor1 {}
+/// impl actix::Supervised for MyActor1 {}
 ///
-/// impl ArbiterService for MyActor1 {
+/// impl actix::ArbiterService for MyActor1 {
 ///    fn service_started(&mut self, ctx: &mut Context<Self>) {
 ///       println!("Service started");
 ///    }
 /// }
 ///
 /// impl Handler<Ping> for MyActor1 {
+///    type Result = ();
 ///
-///    fn handle(&mut self, _: Ping, ctx: &mut Context<Self>) -> Response<Self, Ping> {
+///    fn handle(&mut self, _: Ping, ctx: &mut Context<Self>) {
 ///       println!("ping");
-///       Arbiter::system().send(msgs::SystemExit(0));
-///       Self::empty()
+/// #     Arbiter::system().send(actix::msgs::SystemExit(0));
 ///    }
 /// }
 ///
@@ -59,7 +55,7 @@ use supervisor::Supervisor;
 ///
 ///    fn started(&mut self, _: &mut Context<Self>) {
 ///       let act = Arbiter::registry().get::<MyActor1>();
-///       act.send(Ping)
+///       act.send(Ping);
 ///    }
 /// }
 ///
@@ -76,7 +72,7 @@ use supervisor::Supervisor;
 ///
 ///    // Run system, this function blocks current thread
 ///    let code = sys.run();
-///    std::process::exit(code);
+/// #  std::process::exit(code);
 /// }
 /// ```
 pub struct Registry {
@@ -106,14 +102,14 @@ impl Registry {
     /// Query registry for specific actor. Returns address of the actor.
     /// If actor is not registered, starts new actor and
     /// return address of newly created actor.
-    pub fn get<A: ArbiterService + Actor<Context=Context<A>>>(&self) -> Address<A> {
+    pub fn get<A: ArbiterService + Actor<Context=Context<A>>>(&self) -> LocalAddress<A> {
         let id = TypeId::of::<A>();
         if let Some(addr) = self.registry.borrow().get(&id) {
-            if let Some(addr) = addr.downcast_ref::<Address<A>>() {
+            if let Some(addr) = addr.downcast_ref::<LocalAddress<A>>() {
                 return addr.clone()
             }
         }
-        let addr: Address<_> = A::create(|ctx| {
+        let addr: LocalAddress<_> = Supervisor::start(|ctx| {
             let mut act = A::default();
             act.service_started(ctx);
             act
@@ -140,12 +136,12 @@ impl SystemRegistry {
         SystemRegistry{registry: Arc::new(Mutex::new(RefCell::new(HashMap::new())))}
     }
 
-    /// Return addres of the service. If service actor is not running
+    /// Return address of the service. If service actor is not running
     /// it get started in system arbiter.
-    pub fn get<A: SystemService + Actor<Context=Context<A>>>(&self) -> SyncAddress<A> {
+    pub fn get<A: SystemService + Actor<Context=Context<A>>>(&self) -> Address<A> {
         if let Ok(hm) = self.registry.lock() {
             if let Some(addr) = hm.borrow().get(&TypeId::of::<A>()) {
-                match addr.downcast_ref::<SyncAddress<A>>() {
+                match addr.downcast_ref::<Address<A>>() {
                     Some(addr) => {
                         return addr.clone()
                     },
@@ -153,11 +149,11 @@ impl SystemRegistry {
                         error!("Got unknown value: {:?}", addr),
                 }
             }
-            let addr = Supervisor::start_in(Arbiter::system_arbiter(), false, |ctx| {
+            let addr = Supervisor::start_in(&Arbiter::system_arbiter(), |ctx| {
                 let mut act = A::default();
                 act.service_started(ctx);
                 act
-            }).expect("System is dead");
+            });
             hm.borrow_mut().insert(TypeId::of::<A>(), Box::new(addr.clone()));
             return addr
         }

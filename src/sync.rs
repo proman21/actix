@@ -3,16 +3,15 @@
 //! Sync actors could be used for cpu bound behavior. Only one sync actor
 //! runs within arbiter's thread. Sync actor process one message at a time.
 //! Sync arbiter can start mutiple threads with separate instance of actor in each.
-//! Multi consummer queue is used as a communication channel queue.
+//! Multi consumer queue is used as a communication channel queue.
 //! To be able to start sync actor via `SyncArbiter`
 //! Actor has to use `SyncContext` as an execution context.
 //!
 //! ## Example
 //!
 //! ```rust
-//! extern crate actix;
-//! extern crate futures;
-//!
+//! # extern crate actix;
+//! # extern crate futures;
 //! use actix::prelude::*;
 //!
 //! struct Fibonacci(pub u32);
@@ -29,11 +28,13 @@
 //! }
 //!
 //! impl Handler<Fibonacci> for SyncActor {
-//!     fn handle(&mut self, msg: Fibonacci, _: &mut Self::Context) -> Response<Self, Fibonacci> {
+//!     type Result = MessageResult<Fibonacci>;
+//!
+//!     fn handle(&mut self, msg: Fibonacci, _: &mut Self::Context) -> Self::Result {
 //!         if msg.0 == 0 {
-//!             Self::reply_error(())
+//!             Err(())
 //!         } else if msg.0 == 1 {
-//!             Self::reply(1)
+//!             Ok(1)
 //!         } else {
 //!             let mut i = 0;
 //!             let mut sum = 0;
@@ -45,7 +46,7 @@
 //!                 curr = sum;
 //!                 i += 1;
 //!             }
-//!             Self::reply(sum)
+//!             Ok(sum)
 //!         }
 //!    }
 //! }
@@ -62,7 +63,7 @@
 //!     }
 //!
 //!     Arbiter::handle().spawn_fn(|| {
-//!         Arbiter::system().send(msgs::SystemExit(0));
+//! #        Arbiter::system().send(actix::msgs::SystemExit(0));
 //!         futures::future::result(Ok(()))
 //!     });
 //!
@@ -74,23 +75,24 @@ use std::thread;
 use std::sync::Arc;
 use std::marker::PhantomData;
 
-use crossbeam::sync::MsQueue;
+use crossbeam_channel as channel;
 use futures::{Async, Future, Poll, Stream};
 use futures::sync::oneshot::Sender as SyncSender;
 use tokio_core::reactor::Core;
 
-use actor::{Actor, ActorContext, ActorState, Handler, ResponseType};
+use actor::{Actor, ActorContext, ActorState};
 use arbiter::Arbiter;
-use address::SyncAddress;
+use address::Address;
 use context::Context;
+use handler::{Handler, Response, ResponseType, IntoResponse};
 use envelope::{Envelope, EnvelopeProxy, ToEnvelope};
-use message::Response;
-use queue::sync;
+use addr::channel as sync;
+use addr::AddressReceiver;
 
 /// Sync arbiter
 pub struct SyncArbiter<A> where A: Actor<Context=SyncContext<A>> {
-    queue: Arc<MsQueue<SyncContextProtocol<A>>>,
-    msgs: sync::UnboundedReceiver<Envelope<A>>,
+    queue: channel::Sender<SyncContextProtocol<A>>,
+    msgs: AddressReceiver<A>,
     threads: usize,
 }
 
@@ -98,26 +100,26 @@ impl<A> SyncArbiter<A> where A: Actor<Context=SyncContext<A>> + Send {
 
     /// Start new sync arbiter with specified number of worker threads.
     /// Returns address of started actor.
-    pub fn start<F>(threads: usize, f: F) -> SyncAddress<A>
-        where F: Fn() -> A + 'static
+    pub fn start<F>(threads: usize, factory: F) -> Address<A>
+        where F: Sync + Send + Fn() -> A + 'static
     {
-        let queue = Arc::new(MsQueue::new());
+        let factory = Arc::new(factory);
+        let (sender, receiver) = channel::unbounded();
 
         for _ in 0..threads {
-            let actor = f();
-            let actor_queue = Arc::clone(&queue);
+            let f = Arc::clone(&factory);
+            let actor_queue = receiver.clone();
 
             thread::spawn(move || {
-                SyncContext::new(actor, actor_queue)
-                    .run()
+                SyncContext::new(f, actor_queue).run()
             });
         }
 
-        let (tx, rx) = sync::unbounded();
+        let (tx, rx) = sync::channel(0);
         Arbiter::handle().spawn(
-            SyncArbiter{queue: queue, msgs: rx, threads: threads});
+            SyncArbiter{queue: sender, msgs: rx, threads: threads});
 
-        SyncAddress::new(tx)
+        Address::new(tx)
     }
 }
 
@@ -135,13 +137,13 @@ impl<A> Future for SyncArbiter<A> where A: Actor<Context=SyncContext<A>>
         loop {
             match self.msgs.poll() {
                 Ok(Async::Ready(Some(msg))) => {
-                    self.queue.push(SyncContextProtocol::Envelope(msg));
+                    let _ = self.queue.send(SyncContextProtocol::Envelope(msg));
                 }
                 Ok(Async::NotReady) => break,
                 Ok(Async::Ready(None)) | Err(_) => {
                     // stop sync arbiters
                     for _ in 0..self.threads {
-                        self.queue.push(SyncContextProtocol::Stop);
+                        let _ = self.queue.send(SyncContextProtocol::Stop);
                     }
                     return Ok(Async::Ready(()))
                 },
@@ -154,7 +156,8 @@ impl<A> Future for SyncArbiter<A> where A: Actor<Context=SyncContext<A>>
 impl<A> ToEnvelope<A> for SyncContext<A>
     where A: Actor<Context=SyncContext<A>>,
 {
-    fn pack<M>(msg: M, tx: Option<SyncSender<Result<M::Item, M::Error>>>) -> Envelope<A>
+    fn pack<M>(msg: M,
+               tx: Option<SyncSender<Result<M::Item, M::Error>>>) -> Envelope<A>
         where A: Handler<M>,
               M: ResponseType + Send + 'static,
               <M as ResponseType>::Item: Send,
@@ -173,20 +176,25 @@ enum SyncContextProtocol<A> where A: Actor<Context=SyncContext<A>> {
 pub struct SyncContext<A> where A: Actor<Context=SyncContext<A>> {
     act: A,
     core: Option<Core>,
-    queue: Arc<MsQueue<SyncContextProtocol<A>>>,
+    queue: channel::Receiver<SyncContextProtocol<A>>,
     stopping: bool,
     state: ActorState,
+    factory: Arc<Fn() -> A + Send + Sync>,
+    restart: bool,
 }
 
 impl<A> SyncContext<A> where A: Actor<Context=Self> {
     /// Create new SyncContext
-    fn new(act: A, queue: Arc<MsQueue<SyncContextProtocol<A>>>) -> Self {
+    fn new(factory: Arc<Fn() -> A+Send+Sync>,
+           queue: channel::Receiver<SyncContextProtocol<A>>) -> Self {
         SyncContext {
-            act: act,
+            act: factory(),
             core: None,
             queue: queue,
             stopping: false,
             state: ActorState::Started,
+            factory: factory,
+            restart: false,
         }
     }
 
@@ -200,17 +208,34 @@ impl<A> SyncContext<A> where A: Actor<Context=Self> {
         self.state = ActorState::Running;
 
         loop {
-            match self.queue.pop() {
-                SyncContextProtocol::Stop => {
+            match self.queue.recv() {
+                Ok(SyncContextProtocol::Stop) => {
                     self.state = ActorState::Stopping;
                     A::stopping(&mut self.act, ctx);
                     self.state = ActorState::Stopped;
                     A::stopped(&mut self.act, ctx);
                     return
                 },
-                SyncContextProtocol::Envelope(mut env) => {
-                    env.handle(&mut self.act, ctx)
+                Ok(SyncContextProtocol::Envelope(mut env)) => {
+                    env.handle(&mut self.act, ctx);
+
+                    if self.restart {
+                        self.restart = false;
+                        self.stopping = false;
+
+                        // stop old actor
+                        A::stopping(&mut self.act, ctx);
+                        self.state = ActorState::Stopped;
+                        A::stopped(&mut self.act, ctx);
+
+                        // start new actor
+                        self.state = ActorState::Started;
+                        self.act = (*self.factory)();
+                        A::started(&mut self.act, ctx);
+                        self.state = ActorState::Running;
+                    }
                 },
+                Err(_) => return
             }
 
             if self.stopping {
@@ -220,6 +245,11 @@ impl<A> SyncContext<A> where A: Actor<Context=Self> {
                 return
             }
         }
+    }
+
+    /// Initiate actor restart process.
+    pub fn restart(&mut self) {
+        self.restart = true;
     }
 }
 
@@ -256,7 +286,9 @@ impl<A, M>  SyncEnvelope<A, M>
           M: ResponseType,
 {
     pub fn new(msg: M, tx: Option<SyncSender<Result<M::Item, M::Error>>>) -> Self {
-        SyncEnvelope{msg: Some(msg), tx: tx, actor: PhantomData}
+        SyncEnvelope{msg: Some(msg),
+                     tx: tx,
+                     actor: PhantomData}
     }
 }
 
@@ -266,12 +298,17 @@ impl<A, M> EnvelopeProxy for SyncEnvelope<A, M>
 {
     type Actor = A;
 
-    fn handle(&mut self, act: &mut Self::Actor, ctx: &mut <Self::Actor as Actor>::Context)
+    fn handle(&mut self, act: &mut A, ctx: &mut A::Context)
     {
-        if let Some(msg) = self.msg.take() {
-            let mut response = <Self::Actor as Handler<M>>::handle(act, msg, ctx);
+        let tx = self.tx.take();
+        if tx.is_some() && tx.as_ref().unwrap().is_canceled() {
+            return
+        }
 
-            let result = if response.is_async() {
+        if let Some(msg) = self.msg.take() {
+            let mut response = <A as Handler<M>>::handle(act, msg, ctx).into_response();
+
+            let result = if !response.is_async() {
                 response.result().unwrap()
             } else {
                 if ctx.core.is_none() {
@@ -286,7 +323,7 @@ impl<A, M> EnvelopeProxy for SyncEnvelope<A, M>
                     ctx: ctx_ptr})
             };
 
-            if let Some(tx) = self.tx.take() {
+            if let Some(tx) = tx {
                 let _ = tx.send(result);
             }
         }

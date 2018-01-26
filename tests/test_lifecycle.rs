@@ -14,7 +14,7 @@ use actix::prelude::*;
 use actix::msgs::SystemExit;
 
 
-struct MyActor{
+struct MyActor {
     started: Arc<AtomicBool>,
     stopping: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
@@ -23,23 +23,26 @@ struct MyActor{
 }
 
 impl Actor for MyActor {
-    type Context = Context<Self>;
+    type Context = actix::Context<Self>;
 
-    fn started(&mut self, _: &mut Context<MyActor>) {
+    fn started(&mut self, _: &mut Self::Context) {
         self.started.store(true, Ordering::Relaxed);
     }
-    fn stopping(&mut self, ctx: &mut Context<MyActor>) {
+    fn stopping(&mut self, ctx: &mut Self::Context) -> bool {
         self.stopping.store(true, Ordering::Relaxed);
 
         if self.restore_after_stop {
             let (tx, rx) = channel();
             self.temp = Some(tx);
             rx.actfuture().then(|_, _: &mut MyActor, _: &mut _| {
-                fut::result(Ok(()))
+                actix::fut::result(Ok(()))
             }).spawn(ctx);
+            false
+        } else {
+            true
         }
     }
-    fn stopped(&mut self, _: &mut Context<MyActor>) {
+    fn stopped(&mut self, _: &mut Self::Context) {
         self.stopped.store(true, Ordering::Relaxed);
     }
 }
@@ -52,7 +55,7 @@ fn test_active_address() {
     let stopping = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
 
-    let _addr: Address<_> = MyActor{
+    let _addr: LocalAddress<_> = MyActor{
         started: Arc::clone(&started),
         stopping: Arc::clone(&stopping),
         stopped: Arc::clone(&stopped),
@@ -81,7 +84,7 @@ fn test_active_sync_address() {
     let stopping = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
 
-    let _addr: SyncAddress<_> = MyActor{
+    let _addr: Address<_> = MyActor{
         started: Arc::clone(&started),
         stopping: Arc::clone(&stopping),
         stopped: Arc::clone(&stopped),
@@ -110,7 +113,7 @@ fn test_stop_after_drop_address() {
     let stopping = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
 
-    let addr: Address<_> = MyActor{
+    let addr: LocalAddress<_> = MyActor{
         started: Arc::clone(&started),
         stopping: Arc::clone(&stopping),
         stopped: Arc::clone(&stopped),
@@ -148,7 +151,7 @@ fn test_stop_after_drop_sync_address() {
     let stopping = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
 
-    let addr: SyncAddress<_> = MyActor{
+    let addr: Address<_> = MyActor{
         started: Arc::clone(&started),
         stopping: Arc::clone(&stopping),
         stopped: Arc::clone(&stopped),

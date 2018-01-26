@@ -15,6 +15,8 @@ mod stream_map_err;
 mod stream_then;
 mod stream_and_then;
 mod stream_finish;
+mod stream_fold;
+mod helpers;
 
 pub use self::either::Either;
 pub use self::and_then::AndThen;
@@ -27,9 +29,10 @@ pub use self::stream_map_err::StreamMapErr;
 pub use self::stream_then::StreamThen;
 pub use self::stream_and_then::StreamAndThen;
 pub use self::stream_finish::StreamFinish;
+pub use self::stream_fold::StreamFold;
+pub use self::helpers::{Finish, FinishStream};
 
 use actor::Actor;
-
 
 /// Trait for types which are a placeholder of a value that may become
 /// available at some later point in time.
@@ -150,6 +153,17 @@ pub trait ActorStream {
         stream_and_then::new(self, f)
     }
 
+    /// Execute an accumulating computation over a stream, collecting all the
+    /// values into one final result.
+    fn fold<F, T, Fut>(self, init: T, f: F) -> StreamFold<Self, F, Fut, T>
+        where F: FnMut(T, Self::Item, &mut Self::Actor, &mut <Self::Actor as Actor>::Context) -> Fut,
+              Fut: IntoActorFuture<Actor=Self::Actor, Item=T>,
+              Self::Error: From<Fut::Error>,
+              Self: Sized
+    {
+        stream_fold::new(self, f, init)
+    }
+
     /// Converts a stream to a future that resolves when stream completes.
     fn finish(self) -> StreamFinish<Self>
         where Self: Sized
@@ -200,7 +214,11 @@ pub trait WrapFuture<A> where A: Actor
     /// The error that the future may resolve with.
     type Error;
 
+    #[doc(hidden)]
     fn actfuture(self) -> Self::Future;
+
+    /// Convert normal future to a ActorFuture
+    fn into_actor(self, a: &A) -> Self::Future;
 }
 
 impl<F: Future, A: Actor> WrapFuture<A> for F {
@@ -208,7 +226,12 @@ impl<F: Future, A: Actor> WrapFuture<A> for F {
     type Item = F::Item;
     type Error = F::Error;
 
+    #[doc(hidden)]
     fn actfuture(self) -> Self::Future {
+        wrap_future(self)
+    }
+
+    fn into_actor(self, _: &A) -> Self::Future {
         wrap_future(self)
     }
 }

@@ -1,14 +1,13 @@
-use std::string::ToString;
 use std::collections::HashMap;
 use tokio_core::reactor::{Core, Handle};
 use futures::sync::oneshot::{channel, Receiver, Sender};
 
-use actor::{Actor, Handler, ResponseType};
-use address::SyncAddress;
+use actor::Actor;
+use address::Address;
 use arbiter::Arbiter;
+use handler::{Handler, ResponseType};
 use context::Context;
 use msgs::{SystemExit, StopArbiter};
-use message::Response;
 
 /// System is an actor which manages process.
 ///
@@ -33,7 +32,7 @@ use message::Response;
 ///    fn started(&mut self, ctx: &mut Context<Self>) {
 ///        ctx.run_later(self.dur, |act, ctx| {
 ///            // send `SystemExit` to `System` actor.
-///            Arbiter::system().send(msgs::SystemExit(0));
+///            Arbiter::system().send(actix::msgs::SystemExit(0));
 ///        });
 ///    }
 /// }
@@ -52,7 +51,7 @@ use message::Response;
 /// ```
 pub struct System {
     stop: Option<Sender<i32>>,
-    arbiters: HashMap<String, SyncAddress<Arbiter>>,
+    arbiters: HashMap<String, Address<Arbiter>>,
 }
 
 impl Actor for System {
@@ -63,14 +62,15 @@ impl System {
 
     #[cfg_attr(feature="cargo-clippy", allow(new_ret_no_self))]
     /// Create new system
-    pub fn new<T: ToString>(name: T) -> SystemRunner {
-        let core = Arbiter::new_system(name.to_string());
+    pub fn new<T: Into<String>>(name: T) -> SystemRunner {
+        let name = name.into();
+        let core = Arbiter::new_system(name.clone());
         let (stop_tx, stop_rx) = channel();
 
         // start system
         let sys = System {
             arbiters: HashMap::new(), stop: Some(stop_tx)}.start();
-        Arbiter::set_system(sys, name.to_string());
+        Arbiter::set_system(sys, name);
 
         SystemRunner {
             core: core,
@@ -107,10 +107,11 @@ impl SystemRunner {
 }
 
 impl Handler<SystemExit> for System {
+    type Result = ();
 
-    fn handle(&mut self, msg: SystemExit, _: &mut Context<Self>) -> Response<Self, SystemExit>
+    fn handle(&mut self, msg: SystemExit, _: &mut Context<Self>)
     {
-        // stop rbiters
+        // stop arbiters
         for addr in self.arbiters.values() {
             addr.send(StopArbiter(msg.0));
         }
@@ -118,12 +119,11 @@ impl Handler<SystemExit> for System {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(msg.0);
         }
-        Self::empty()
     }
 }
 
 /// Register Arbiter within system
-pub(crate) struct RegisterArbiter(pub String, pub SyncAddress<Arbiter>);
+pub(crate) struct RegisterArbiter(pub String, pub Address<Arbiter>);
 
 #[doc(hidden)]
 impl ResponseType for RegisterArbiter {
@@ -133,12 +133,10 @@ impl ResponseType for RegisterArbiter {
 
 #[doc(hidden)]
 impl Handler<RegisterArbiter> for System {
+    type Result = ();
 
-    fn handle(&mut self, msg: RegisterArbiter, _: &mut Context<Self>)
-              -> Response<Self, RegisterArbiter>
-    {
+    fn handle(&mut self, msg: RegisterArbiter, _: &mut Context<Self>) {
         self.arbiters.insert(msg.0, msg.1);
-        Self::empty()
     }
 }
 
@@ -153,11 +151,10 @@ impl ResponseType for UnregisterArbiter {
 
 #[doc(hidden)]
 impl Handler<UnregisterArbiter> for System {
+    type Result = ();
 
     fn handle(&mut self, msg: UnregisterArbiter, _: &mut Context<Self>)
-              -> Response<Self, UnregisterArbiter>
     {
         self.arbiters.remove(&msg.0);
-        Self::empty()
     }
 }

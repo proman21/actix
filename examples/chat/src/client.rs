@@ -1,4 +1,4 @@
-extern crate actix;
+#[macro_use] extern crate actix;
 extern crate bytes;
 extern crate byteorder;
 extern crate futures;
@@ -12,6 +12,7 @@ use std::{io, net, process, thread};
 use std::str::FromStr;
 use std::time::Duration;
 use futures::Future;
+use tokio_io::AsyncRead;
 use tokio_core::net::TcpStream;
 use actix::prelude::*;
 
@@ -26,7 +27,9 @@ fn main() {
     Arbiter::handle().spawn(
         TcpStream::connect(&addr, Arbiter::handle())
             .and_then(|stream| {
-                let addr: SyncAddress<_> = ChatClient.framed(stream, codec::ClientChatCodec);
+                let addr: Address<_> = ChatClient::create_with(
+                    stream.framed(codec::ClientChatCodec),
+                    |_, framed| ChatClient{framed: framed});
 
                 // start console loop
                 thread::spawn(move|| {
@@ -54,30 +57,36 @@ fn main() {
 }
 
 
-struct ChatClient;
-
-struct ClientCommand(String);
-
-impl ResponseType for ClientCommand {
-    type Item = ();
-    type Error = ();
+struct ChatClient {
+    framed: FramedCell<TcpStream, codec::ClientChatCodec>,
 }
 
-impl Actor for ChatClient {
-    type Context = FramedContext<Self>;
+#[derive(Message)]
+struct ClientCommand(String);
 
-    fn started(&mut self, ctx: &mut FramedContext<Self>) {
+impl Actor for ChatClient {
+    type Context = Context<Self>;
+
+    fn started(&mut self, ctx: &mut Context<Self>) {
         // start heartbeats otherwise server will disconnect after 10 seconds
         self.hb(ctx)
+    }
+
+    fn stopping(&mut self, _: &mut Context<Self>) -> bool {
+        println!("Disconnected");
+
+        // Stop application on disconnect
+        Arbiter::system().send(actix::msgs::SystemExit(0));
+
+        true
     }
 }
 
 impl ChatClient {
-    fn hb(&self, ctx: &mut FramedContext<Self>) {
+    fn hb(&self, ctx: &mut Context<Self>) {
         ctx.run_later(Duration::new(1, 0), |act, ctx| {
-            if ctx.send(codec::ChatRequest::Ping).is_ok() {
-                act.hb(ctx);
-            }
+            act.framed.send(codec::ChatRequest::Ping);
+            act.hb(ctx);
         });
     }
 }
@@ -85,9 +94,9 @@ impl ChatClient {
 /// Handle stdin commands
 impl Handler<ClientCommand> for ChatClient
 {
-    fn handle(&mut self, msg: ClientCommand, ctx: &mut FramedContext<Self>)
-              -> Response<Self, ClientCommand>
-    {
+    type Result = ();
+
+    fn handle(&mut self, msg: ClientCommand, _: &mut Context<Self>) {
         let m = msg.0.trim();
 
         // we check for /sss type of messages
@@ -95,11 +104,11 @@ impl Handler<ClientCommand> for ChatClient
             let v: Vec<&str> = m.splitn(2, ' ').collect();
             match v[0] {
                 "/list" => {
-                    let _ = ctx.send(codec::ChatRequest::List);
+                    let _ = self.framed.send(codec::ChatRequest::List);
                 },
                 "/join" => {
                     if v.len() == 2 {
-                        let _ = ctx.send(codec::ChatRequest::Join(v[1].to_owned()));
+                        let _ = self.framed.send(codec::ChatRequest::Join(v[1].to_owned()));
                     } else {
                         println!("!!! room name is required");
                     }
@@ -107,52 +116,32 @@ impl Handler<ClientCommand> for ChatClient
                 _ => println!("!!! unknown command"),
             }
         } else {
-            let _ = ctx.send(codec::ChatRequest::Message(m.to_owned()));
+            let _ = self.framed.send(codec::ChatRequest::Message(m.to_owned()));
         }
-
-        Self::empty()
     }
 }
 
 /// Server communication
+impl FramedActor<TcpStream, codec::ClientChatCodec> for ChatClient {
 
-impl FramedActor for ChatClient {
-    type Io = TcpStream;
-    type Codec = codec::ClientChatCodec;
-}
-
-impl StreamHandler<codec::ChatResponse, io::Error> for ChatClient {
-
-    fn finished(&mut self, _: &mut FramedContext<Self>) {
-        println!("Disconnected");
-
-        // Stop application on disconnect
-        Arbiter::system().send(msgs::SystemExit(0));
-    }
-}
-
-impl Handler<codec::ChatResponse, io::Error> for ChatClient {
-
-    fn handle(&mut self, msg: codec::ChatResponse, _: &mut FramedContext<Self>)
-              -> Response<Self, codec::ChatResponse>
-    {
-        match msg {
-            codec::ChatResponse::Message(ref msg) => {
-                println!("message: {}", msg);
-            }
-            codec::ChatResponse::Joined(ref msg) => {
-                println!("!!! joined: {}", msg);
-            }
-            codec::ChatResponse::Rooms(rooms) => {
-                println!("\n!!! Available rooms:");
-                for room in rooms {
-                    println!("{}", room);
+    fn handle(&mut self, msg: io::Result<codec::ChatResponse>, _: &mut Context<Self>) {
+        if let Ok(msg) = msg {
+            match msg {
+                codec::ChatResponse::Message(ref msg) => {
+                    println!("message: {}", msg);
                 }
-                println!("");
+                codec::ChatResponse::Joined(ref msg) => {
+                    println!("!!! joined: {}", msg);
+                }
+                codec::ChatResponse::Rooms(rooms) => {
+                    println!("\n!!! Available rooms:");
+                    for room in rooms {
+                        println!("{}", room);
+                    }
+                    println!("");
+                }
+                _ => (),
             }
-            _ => (),
         }
-
-        Self::empty()
     }
 }

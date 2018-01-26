@@ -16,24 +16,24 @@ impl ResponseType for Num {
 struct MyActor(Arc<AtomicUsize>, Arc<AtomicBool>);
 
 impl Actor for MyActor {
-    type Context = Context<Self>;
-}
+    type Context = actix::Context<Self>;
 
-impl StreamHandler<Num> for MyActor {
-    fn finished(&mut self, _: &mut Self::Context) {
-        Arbiter::system().send(msgs::SystemExit(0));
+    fn stopping(&mut self, _: &mut Self::Context) -> bool {
+        println!("SEND");
+        Arbiter::system().send(actix::msgs::SystemExit(0));
+        true
     }
 }
 
-impl Handler<Num> for MyActor {
+impl actix::Handler<Result<Num, ()>> for MyActor {
+    type Result = ();
 
-    fn error(&mut self, _: (), _: &mut Self::Context) {
-        self.1.store(true, Ordering::Relaxed);
-    }
-
-    fn handle(&mut self, msg: Num, _: &mut Context<MyActor>) -> Response<Self, Num> {
-        self.0.store(self.0.load(Ordering::Relaxed) + msg.0, Ordering::Relaxed);
-        Self::empty()
+    fn handle(&mut self, msg: Result<Num, ()>, _: &mut actix::Context<MyActor>) {
+        if let Ok(msg) = msg {
+            self.0.store(self.0.load(Ordering::Relaxed) + msg.0, Ordering::Relaxed);
+        } else {
+            self.1.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -65,7 +65,7 @@ fn test_stream_with_error() {
     let act_count = Arc::clone(&count);
     let act_error = Arc::clone(&error);
     MyActor::create::<(), _>(move |ctx| {
-        ctx.add_stream(futures::stream::iter(items));
+        ctx.add_stream(futures::stream::iter_result(items));
         MyActor(act_count, act_error)
     });
 
