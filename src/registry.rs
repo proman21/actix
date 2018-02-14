@@ -1,3 +1,8 @@
+//! Actors registry
+//!
+//! Actor can register itself as a service. Service can be defined as
+//! `ArbiterService` which is unique per arbiter or `SystemService` which is
+//! unique per system.
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -6,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use actor::{Actor, Supervised};
 use arbiter::Arbiter;
-use address::{Address, LocalAddress};
+use address::{Addr, Syn, Unsync};
 use context::Context;
 use supervisor::Supervisor;
 
@@ -33,7 +38,7 @@ use supervisor::Supervisor;
 /// }
 /// impl actix::Supervised for MyActor1 {}
 ///
-/// impl actix::ArbiterService for MyActor1 {
+/// impl ArbiterService for MyActor1 {
 ///    fn service_started(&mut self, ctx: &mut Context<Self>) {
 ///       println!("Service started");
 ///    }
@@ -44,7 +49,7 @@ use supervisor::Supervisor;
 ///
 ///    fn handle(&mut self, _: Ping, ctx: &mut Context<Self>) {
 ///       println!("ping");
-/// #     Arbiter::system().send(actix::msgs::SystemExit(0));
+/// #     Arbiter::system().do_send(actix::msgs::SystemExit(0));
 ///    }
 /// }
 ///
@@ -55,7 +60,7 @@ use supervisor::Supervisor;
 ///
 ///    fn started(&mut self, _: &mut Context<Self>) {
 ///       let act = Arbiter::registry().get::<MyActor1>();
-///       act.send(Ping);
+///       act.do_send(Ping);
 ///    }
 /// }
 ///
@@ -82,15 +87,27 @@ pub struct Registry {
 /// Trait defines arbiter's service.
 #[allow(unused_variables)]
 pub trait ArbiterService: Actor<Context=Context<Self>> + Supervised + Default {
+
     /// Method is called during service initialization.
     fn service_started(&mut self, ctx: &mut Context<Self>) {}
+
+    /// Get actor's address from arbiter registry
+    fn from_registry() -> Addr<Unsync, Self> {
+        Arbiter::registry().get::<Self>()
+    }
 }
 
 /// Trait defines system's service.
 #[allow(unused_variables)]
 pub trait SystemService: Actor<Context=Context<Self>> + Supervised + Default {
+
     /// Method is called during service initialization.
     fn service_started(&mut self, ctx: &mut Context<Self>) {}
+
+    /// Get actor's address from system registry
+    fn from_registry() -> Addr<Syn, Self> {
+        Arbiter::system_registry().get::<Self>()
+    }
 }
 
 impl Registry {
@@ -102,14 +119,14 @@ impl Registry {
     /// Query registry for specific actor. Returns address of the actor.
     /// If actor is not registered, starts new actor and
     /// return address of newly created actor.
-    pub fn get<A: ArbiterService + Actor<Context=Context<A>>>(&self) -> LocalAddress<A> {
+    pub fn get<A: ArbiterService + Actor<Context=Context<A>>>(&self) -> Addr<Unsync, A> {
         let id = TypeId::of::<A>();
         if let Some(addr) = self.registry.borrow().get(&id) {
-            if let Some(addr) = addr.downcast_ref::<LocalAddress<A>>() {
+            if let Some(addr) = addr.downcast_ref::<Addr<Unsync, A>>() {
                 return addr.clone()
             }
         }
-        let addr: LocalAddress<_> = Supervisor::start(|ctx| {
+        let addr: Addr<Unsync, A> = Supervisor::start(|ctx| {
             let mut act = A::default();
             act.service_started(ctx);
             act
@@ -120,41 +137,45 @@ impl Registry {
     }
 }
 
+// TODO: Remove lock
 /// System wide actors registry
 ///
 /// System registry serves same purpose as [Registry](struct.Registry.html), except
 /// it is shared across all arbiters.
 pub struct SystemRegistry {
-    #[cfg_attr(feature="cargo-clippy", allow(type_complexity))]
-    registry: Arc<Mutex<RefCell<HashMap<TypeId, Box<Any>>>>>,
+    registry: Arc<Mutex<HashMap<TypeId, Box<Any>>>>,
 }
 
 unsafe impl Send for SystemRegistry {}
 
 impl SystemRegistry {
     pub(crate) fn new() -> Self {
-        SystemRegistry{registry: Arc::new(Mutex::new(RefCell::new(HashMap::new())))}
+        SystemRegistry{registry: Arc::new(Mutex::new(HashMap::new()))}
     }
 
     /// Return address of the service. If service actor is not running
     /// it get started in system arbiter.
-    pub fn get<A: SystemService + Actor<Context=Context<A>>>(&self) -> Address<A> {
-        if let Ok(hm) = self.registry.lock() {
-            if let Some(addr) = hm.borrow().get(&TypeId::of::<A>()) {
-                match addr.downcast_ref::<Address<A>>() {
-                    Some(addr) => {
-                        return addr.clone()
-                    },
-                    None =>
-                        error!("Got unknown value: {:?}", addr),
+    pub fn get<A: SystemService + Actor<Context=Context<A>>>(&self) -> Addr<Syn,A> {
+        {
+            if let Ok(hm) = self.registry.lock() {
+                if let Some(addr) = hm.get(&TypeId::of::<A>()) {
+                    match addr.downcast_ref::<Addr<Syn, A>>() {
+                        Some(addr) => {
+                            return addr.clone()
+                        },
+                        None => error!("Got unknown value: {:?}", addr),
+                    }
                 }
-            }
-            let addr = Supervisor::start_in(&Arbiter::system_arbiter(), |ctx| {
-                let mut act = A::default();
-                act.service_started(ctx);
-                act
-            });
-            hm.borrow_mut().insert(TypeId::of::<A>(), Box::new(addr.clone()));
+            } else { panic!("System registry lock is poisoned"); }
+        }
+
+        let addr = Supervisor::start_in(&Arbiter::system_arbiter(), |ctx| {
+            let mut act = A::default();
+            act.service_started(ctx);
+            act
+        });
+        if let Ok(mut hm) = self.registry.lock() {
+            hm.insert(TypeId::of::<A>(), Box::new(addr.clone()));
             return addr
         }
         panic!("System registry lock is poisoned");

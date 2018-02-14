@@ -1,26 +1,39 @@
 //! This is copy of [sync/mpsc/](https://github.com/alexcrichton/futures-rs)
-use std::usize;
-use std::thread;
+use std::{usize, thread};
 use std::cell::Cell;
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::Ordering::{SeqCst, Relaxed};
 use std::sync::{Arc, Mutex};
 
 use futures::task::{self, Task};
 use futures::{Async, Poll, Stream};
 use futures::sync::oneshot::{channel as sync_channel, Receiver};
 
-use super::queue::{Queue, PopResult};
-
 use actor::Actor;
-use address::SendError;
-use handler::{Handler, ResponseType, MessageResult};
-use envelope::{Envelope, ToEnvelope};
+use handler::{Handler, Message};
+
+use super::{SendError, Syn, MessageDestinationTransport, MessageRecipientTransport};
+use super::queue::{Queue, PopResult};
+use super::envelope::{ToEnvelope, SyncEnvelope};
+
+
+pub trait SyncSender<M>: Send
+    where M::Result: Send,
+          M: Message + Send + 'static
+{
+    fn do_send(&self, msg: M) -> Result<(), SendError<M>>;
+
+    fn try_send(&self, msg: M) -> Result<(), SendError<M>>;
+
+    fn send(&self, msg: M) -> Result<Receiver<M::Result>, SendError<M>>;
+
+    fn boxed(&self) -> Box<SyncSender<M>>;
+}
 
 /// The transmission end of a channel which is used to send values.
 ///
 /// This is created by the `channel` method.
-pub struct AddressSender<A: Actor> {
+pub struct SyncAddressSender<A: Actor> {
     // Channel state shared between the sender and receiver.
     inner: Arc<Inner<A>>,
 
@@ -34,6 +47,8 @@ pub struct AddressSender<A: Actor> {
     maybe_parked: Cell<bool>,
 }
 
+unsafe impl<A: Actor> Sync for SyncAddressSender<A> {}
+
 trait AssertKinds: Send + Sync + Clone {}
 
 
@@ -42,20 +57,20 @@ trait AssertKinds: Send + Sync + Clone {}
 /// This is a concrete implementation of a stream which can be used to represent
 /// a stream of values being computed elsewhere. This is created by the
 /// `channel` method.
-pub struct AddressReceiver<A: Actor> {
+pub struct SyncAddressReceiver<A: Actor> {
     inner: Arc<Inner<A>>,
 }
 
 struct Inner<A: Actor> {
     // Max buffer size of the channel. If `0` then the channel is unbounded.
-    buffer: usize,
+    buffer: AtomicUsize,
 
     // Internal channel state. Consists of the number of messages stored in the
     // channel as well as a flag signalling that the channel is closed.
     state: AtomicUsize,
 
     // Atomic, FIFO queue used to send messages to the receiver
-    message_queue: Queue<Envelope<A>>,
+    message_queue: Queue<SyncEnvelope<A>>,
 
     // Atomic, FIFO queue used to send parked task handles to the receiver.
     parked_queue: Queue<Arc<Mutex<SenderTask>>>,
@@ -140,13 +155,13 @@ impl SenderTask {
 ///
 /// The `Receiver` returned implements the `Stream` trait and has access to any
 /// number of the associated combinators for transforming the result.
-pub fn channel<A: Actor>(buffer: usize) -> (AddressSender<A>, AddressReceiver<A>) {
+pub fn channel<A: Actor>(buffer: usize) -> (SyncAddressSender<A>, SyncAddressReceiver<A>) {
     // Check that the requested buffer size does not exceed the maximum buffer
     // size permitted by the system.
     assert!(buffer < MAX_BUFFER, "requested buffer size too large");
 
     let inner = Arc::new(Inner {
-        buffer: buffer,
+        buffer: AtomicUsize::new(buffer),
         state: AtomicUsize::new(INIT_STATE),
         message_queue: Queue::new(),
         parked_queue: Queue::new(),
@@ -157,17 +172,27 @@ pub fn channel<A: Actor>(buffer: usize) -> (AddressSender<A>, AddressReceiver<A>
         }),
     });
 
-    let tx = AddressSender {
+    let tx = SyncAddressSender {
         inner: Arc::clone(&inner),
         sender_task: Arc::new(Mutex::new(SenderTask::new())),
         maybe_parked: Cell::new(false),
     };
 
-    let rx = AddressReceiver {
+    let rx = SyncAddressReceiver {
         inner: inner,
     };
 
     (tx, rx)
+}
+
+impl<A, M> MessageDestinationTransport<Syn, A, M> for SyncAddressSender<A>
+    where A: Actor + Handler<M>,
+          A::Context: ToEnvelope<Syn, A, M>,
+          M: Message + Send + 'static, M::Result: Send,
+{
+    fn send(&self, msg: M) -> Result<Receiver<M::Result>, SendError<M>> {
+        SyncAddressSender::send(self, msg)
+    }
 }
 
 //
@@ -175,7 +200,7 @@ pub fn channel<A: Actor>(buffer: usize) -> (AddressSender<A>, AddressReceiver<A>
 // ===== impl Sender =====
 //
 //
-impl<A: Actor> AddressSender<A> {
+impl<A: Actor> SyncAddressSender<A> {
 
     pub fn connected(&self) -> bool {
         let curr = self.inner.state.load(SeqCst);
@@ -187,14 +212,14 @@ impl<A: Actor> AddressSender<A> {
     /// Attempts to send a message on this `Sender<A>` with blocking.
     ///
     /// This function, must be called from inside of a task.
-    pub fn send<M>(&self, msg: M) -> Result<Receiver<MessageResult<M>>, SendError<M>>
-        where A: Handler<M>, <A as Actor>::Context: ToEnvelope<A>,
-              M::Item: Send, M::Error: Send,
-              M: ResponseType + Send + 'static,
+    pub fn send<M>(&self, msg: M) -> Result<Receiver<M::Result>, SendError<M>>
+        where A: Handler<M>, A::Context: ToEnvelope<Syn, A, M>,
+              M::Result: Send,
+              M: Message + Send + 'static,
     {
         // If the sender is currently blocked, reject the message
         if !self.poll_unparked(false).is_ready() {
-            return Err(SendError::NotReady(msg))
+            return Err(SendError::Full(msg))
         }
 
         // First, increment the number of messages contained by the channel.
@@ -213,28 +238,24 @@ impl<A: Actor> AddressSender<A> {
         // be parked. This will send the task handle on the parked task queue.
         if park_self {
             self.park(true);
-            Err(SendError::NotReady(msg))
+            Err(SendError::Full(msg))
         } else {
             let (tx, rx) = sync_channel();
-            let env = <A::Context as ToEnvelope<A>>::pack(msg, Some(tx));
+            let env = <A::Context as ToEnvelope<Syn, A, M>>::pack(msg, Some(tx));
             self.queue_push_and_signal(env);
             Ok(rx)
         }
     }
 
     /// Attempts to send a message on this `Sender<A>` without blocking.
-    ///
-    /// This function, unlike `send`, is safe to call whether it's being
-    /// called on a task or not. Note that this function, however, will *not*
-    /// attempt to block the current task if the message cannot be sent.
-    pub fn try_send<M>(&self, msg: M) -> Result<(), SendError<M>>
-        where A: Handler<M>, <A as Actor>::Context: ToEnvelope<A>,
-              M::Item: Send, M::Error: Send,
-              M: ResponseType + Send + 'static,
+    pub fn try_send<M>(&self, msg: M, park: bool) -> Result<(), SendError<M>>
+        where A: Handler<M>, <A as Actor>::Context: ToEnvelope<Syn, A, M>,
+              M::Result: Send,
+              M: Message + Send + 'static,
     {
         // If the sender is currently blocked, reject the message
         if !self.poll_unparked(false).is_ready() {
-            return Err(SendError::NotReady(msg))
+            return Err(SendError::Full(msg))
         }
 
         let park_self = match self.inc_num_messages() {
@@ -243,9 +264,12 @@ impl<A: Actor> AddressSender<A> {
         };
 
         if park_self {
-            Err(SendError::NotReady(msg))
+            if park {
+                self.park(true);
+            }
+            Err(SendError::Full(msg))
         } else {
-            let env = <A::Context as ToEnvelope<A>>::pack(msg, None);
+            let env = <A::Context as ToEnvelope<Syn, A, M>>::pack(msg, None);
             self.queue_push_and_signal(env);
             Ok(())
         }
@@ -255,21 +279,21 @@ impl<A: Actor> AddressSender<A> {
     ///
     /// This function does not park current task.
     pub fn do_send<M>(&self, msg: M) -> Result<(), SendError<M>>
-        where A: Handler<M>, <A as Actor>::Context: ToEnvelope<A>,
-              M::Item: Send, M::Error: Send,
-              M: ResponseType + Send + 'static,
+        where A: Handler<M>, <A as Actor>::Context: ToEnvelope<Syn, A, M>,
+              M::Result: Send,
+              M: Message + Send + 'static,
     {
         if self.inc_num_messages_force().is_none() {
             Err(SendError::Closed(msg))
         } else {
-            let env = <A::Context as ToEnvelope<A>>::pack(msg, None);
+            let env = <A::Context as ToEnvelope<Syn, A, M>>::pack(msg, None);
             self.queue_push_and_signal(env);
             Ok(())
         }
     }
 
     // Push message to the queue and signal to the receiver
-    fn queue_push_and_signal(&self, msg: Envelope<A>) {
+    fn queue_push_and_signal(&self, msg: SyncEnvelope<A>) {
         // Push the message onto the message queue
         self.inner.message_queue.push(msg);
 
@@ -289,7 +313,8 @@ impl<A: Actor> AddressSender<A> {
             }
 
             // receiver is full
-            let park_self = self.inner.buffer != 0 && state.num_messages >= self.inner.buffer;
+            let buffer = self.inner.buffer.load(Relaxed);
+            let park_self = buffer != 0 && state.num_messages >= buffer;
             if park_self {
                 return Some(true);
             }
@@ -317,8 +342,8 @@ impl<A: Actor> AddressSender<A> {
             let next = encode_state(&state);
             match self.inner.state.compare_exchange(curr, next, SeqCst, SeqCst) {
                 Ok(_) => {
-                    let park_self = self.inner.buffer != 0 &&
-                        state.num_messages >= self.inner.buffer;
+                    let buffer = self.inner.buffer.load(Relaxed);
+                    let park_self = buffer != 0 && state.num_messages >= buffer;
                     return Some(park_self)
                 }
                 Err(actual) => curr = actual,
@@ -407,10 +432,46 @@ impl<A: Actor> AddressSender<A> {
             Async::Ready(())
         }
     }
+
+    /// Get `Sender` for a specific message type
+    pub(crate) fn into_sender<M>(self) -> Box<SyncSender<M>>
+        where A: Handler<M>, A::Context: ToEnvelope<Syn, A, M>,
+              M::Result: Send,
+              M: Message + Send + 'static
+    {
+        Box::new(self)
+    }
 }
 
-impl<A: Actor> Clone for AddressSender<A> {
-    fn clone(&self) -> AddressSender<A> {
+impl<A, M> SyncSender<M> for SyncAddressSender<A>
+    where A: Handler<M>, A::Context: ToEnvelope<Syn, A, M>,
+          M::Result: Send,
+          M: Message + Send + 'static,
+{
+    fn do_send(&self, msg: M) -> Result<(), SendError<M>> {
+        self.do_send(msg)
+    }
+    fn try_send(&self, msg: M) -> Result<(), SendError<M>> {
+        self.try_send(msg, true)
+    }
+    fn send(&self, msg: M) -> Result<Receiver<M::Result>, SendError<M>> {
+        self.send(msg)
+    }
+    fn boxed(&self) -> Box<SyncSender<M>> {
+        Box::new(self.clone())
+    }
+}
+
+impl<M> MessageRecipientTransport<Syn, M> for Box<SyncSender<M>>
+    where M: Message + Send + 'static, M::Result: Send,
+{
+    fn send(&self, msg: M) -> Result<Receiver<M::Result>, SendError<M>> {
+        self.as_ref().send(msg)
+    }
+}
+
+impl<A: Actor> Clone for SyncAddressSender<A> {
+    fn clone(&self) -> SyncAddressSender<A> {
         // Since this atomic op isn't actually guarding any memory and we don't
         // care about any orderings besides the ordering on the single atomic
         // variable, a relaxed ordering is acceptable.
@@ -430,7 +491,7 @@ impl<A: Actor> Clone for AddressSender<A> {
             // The ABA problem doesn't matter here. We only care that the
             // number of senders never exceeds the maximum.
             if actual == curr {
-                return AddressSender {
+                return SyncAddressSender {
                     inner: Arc::clone(&self.inner),
                     sender_task: Arc::new(Mutex::new(SenderTask::new())),
                     maybe_parked: Cell::new(false),
@@ -442,7 +503,7 @@ impl<A: Actor> Clone for AddressSender<A> {
     }
 }
 
-impl<A: Actor> Drop for AddressSender<A> {
+impl<A: Actor> Drop for SyncAddressSender<A> {
     fn drop(&mut self) {
         // Ordering between variables don't matter here
         let prev = self.inner.num_senders.fetch_sub(1, SeqCst);
@@ -458,13 +519,41 @@ impl<A: Actor> Drop for AddressSender<A> {
 // ===== impl Receiver =====
 //
 //
-impl<A: Actor> AddressReceiver<A> {
+impl<A: Actor> SyncAddressReceiver<A> {
 
     pub fn connected(&self) -> bool {
         self.inner.num_senders.load(SeqCst) != 0
     }
 
-    pub fn sender(&mut self) -> AddressSender<A> {
+    /// Set channel capacity
+    ///
+    /// This method wakes up all waiting senders if new capacity is greater than current
+    pub fn set_capacity(&mut self, cap: usize) {
+        let buffer = self.inner.buffer.load(Relaxed);
+        self.inner.buffer.store(cap, Relaxed);
+
+        // wake up all
+        if cap > buffer {
+            loop {
+                match unsafe { self.inner.parked_queue.pop() } {
+                    PopResult::Data(task) => {
+                        task.lock().unwrap().notify();
+                    }
+                    PopResult::Empty => {
+                        // Queue empty, no task to wake up.
+                        return;
+                    }
+                    PopResult::Inconsistent => {
+                        // Same as above
+                        thread::yield_now();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get sender side of the channel
+    pub fn sender(&mut self) -> SyncAddressSender<A> {
         // this code same as Sender::clone
         let mut curr = self.inner.num_senders.load(SeqCst);
 
@@ -480,7 +569,7 @@ impl<A: Actor> AddressReceiver<A> {
             // The ABA problem doesn't matter here. We only care that the
             // number of senders never exceeds the maximum.
             if actual == curr {
-                return AddressSender {
+                return SyncAddressSender {
                     inner: Arc::clone(&self.inner),
                     sender_task: Arc::new(Mutex::new(SenderTask::new())),
                     maybe_parked: Cell::new(false),
@@ -491,7 +580,7 @@ impl<A: Actor> AddressReceiver<A> {
         }
     }
 
-    fn next_message(&mut self) -> Async<Option<Envelope<A>>> {
+    fn next_message(&mut self) -> Async<Option<SyncEnvelope<A>>> {
         // Pop off a message
         loop {
             match unsafe { self.inner.message_queue.pop() } {
@@ -572,8 +661,8 @@ impl<A: Actor> AddressReceiver<A> {
     }
 }
 
-impl<A: Actor> Stream for AddressReceiver<A> {
-    type Item = Envelope<A>;
+impl<A: Actor> Stream for SyncAddressReceiver<A> {
+    type Item = SyncEnvelope<A>;
     type Error = ();
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
@@ -614,7 +703,7 @@ impl<A: Actor> Stream for AddressReceiver<A> {
     }
 }
 
-impl<A: Actor> Drop for AddressReceiver<A> {
+impl<A: Actor> Drop for SyncAddressReceiver<A> {
     fn drop(&mut self) {
         // close
         let mut curr = self.inner.state.load(SeqCst);
@@ -660,7 +749,7 @@ impl<A: Actor> Inner<A> {
     // The return value is such that the total number of messages that can be
     // enqueued into the channel will never exceed MAX_CAPACITY
     fn max_senders(&self) -> usize {
-        MAX_CAPACITY - self.buffer
+        MAX_CAPACITY - self.buffer.load(Relaxed)
     }
 }
 
@@ -687,4 +776,83 @@ fn encode_state(state: &State) -> usize {
     }
 
     num
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prelude::*;
+    use std::{time, thread};
+
+    struct Act;
+    impl Actor for Act {
+        type Context = Context<Act>;
+    }
+
+    struct Ping;
+    impl Message for Ping {
+        type Result = ();
+    }
+
+    impl Handler<Ping> for Act {
+        type Result = ();
+        fn handle(&mut self, _: Ping, _: &mut Context<Act>) {}
+    }
+
+    #[test]
+    fn test_cap() {
+        let sys = System::new("test");
+
+        Arbiter::handle().spawn_fn(move || {
+            let (s1, mut recv) = channel::<Act>(1);
+            let s2 = recv.sender();
+
+            let arb: Addr<Syn, _> = Arbiter::new("s1");
+            arb.do_send(actix::msgs::Execute::new(move || -> Result<(), ()> {
+                let _ = s1.send(Ping);
+                Ok(())
+            }));
+            thread::sleep(time::Duration::from_millis(100));
+            let arb2 = Arbiter::new("s1");
+            arb2.do_send(actix::msgs::Execute::new(move || -> Result<(), ()> {
+                let _ = s2.send(Ping);
+                Ok(())
+            }));
+
+            thread::sleep(time::Duration::from_millis(100));
+            let state = decode_state(recv.inner.state.load(SeqCst));
+            assert_eq!(state.num_messages, 1);
+
+            let p = loop {
+                match unsafe { recv.inner.parked_queue.pop() } {
+                    PopResult::Data(task) => break Some(task),
+                    PopResult::Empty => break None,
+                    PopResult::Inconsistent => thread::yield_now(),
+                }
+            };
+
+            assert!(p.is_some());
+            recv.inner.parked_queue.push(p.unwrap());
+
+            recv.set_capacity(10);
+
+            thread::sleep(time::Duration::from_millis(100));
+            let state = decode_state(recv.inner.state.load(SeqCst));
+            assert_eq!(state.num_messages, 1);
+
+            let p = loop {
+                match unsafe { recv.inner.parked_queue.pop() } {
+                    PopResult::Data(task) => break Some(task),
+                    PopResult::Empty => break None,
+                    PopResult::Inconsistent => thread::yield_now(),
+                }
+            };
+            assert!(p.is_none());
+
+            Arbiter::system().do_send(actix::msgs::SystemExit(0));
+            Ok(())
+        });
+
+        sys.run();
+    }
 }

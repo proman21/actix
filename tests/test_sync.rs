@@ -10,9 +10,8 @@ use actix::prelude::*;
 
 struct Fibonacci(pub u32);
 
-impl ResponseType for Fibonacci {
-    type Item = u64;
-    type Error = ();
+impl Message for Fibonacci {
+    type Result = Result<u64, ()>;
 }
 
 struct SyncActor {
@@ -20,7 +19,7 @@ struct SyncActor {
     cond_l: Arc<Mutex<bool>>,
     counter: Arc<AtomicUsize>,
     messages: Arc<AtomicUsize>,
-    addr: Address<System>,
+    addr: Addr<Syn, System>,
 }
 
 impl Actor for SyncActor {
@@ -36,12 +35,12 @@ impl Actor for SyncActor {
 }
 
 impl Handler<Fibonacci> for SyncActor {
-    type Result = MessageResult<Fibonacci>;
+    type Result = Result<u64, ()>;
 
     fn handle(&mut self, msg: Fibonacci, _: &mut Self::Context) -> Self::Result {
         let old = self.messages.fetch_add(1, Ordering::Relaxed);
         if old == 4 {
-            self.addr.send(actix::msgs::SystemExit(0));
+            self.addr.do_send(actix::msgs::SystemExit(0));
         }
 
         if msg.0 == 0 {
@@ -58,8 +57,8 @@ impl Handler<Fibonacci> for SyncActor {
                 last = curr;
                 curr = sum;
                 i += 1;
-	        }
-	        Ok(sum)
+            }
+            Ok(sum)
         }
     }
 }
@@ -93,7 +92,7 @@ fn test_sync() {
 
     Arbiter::handle().spawn_fn(move || {
         for n in 5..10 {
-            addr.send(Fibonacci(n));
+            addr.do_send(Fibonacci(n));
         }
         future::result(Ok(()))
     });

@@ -38,9 +38,8 @@ impl Drop for TrackableItem {
     }
 }
 
-impl ResponseType for Count {
-    type Item = TrackableItem;
-    type Error = ();
+impl Message for Count {
+    type Result = TrackableItem;
 }
 
 impl Actor for CounterActor {
@@ -55,10 +54,10 @@ impl Handler<Count> for CounterActor {
 
         // send a message to self,
         // creating sorta async recursion
-        let my_address: LocalAddress<CounterActor> = ctx.address();
+        let my_address: Addr<Unsync, CounterActor> = ctx.address();
 
-        my_address.send(Count(msg.0 + 1));
-        Ok(TrackableItem::new())
+        my_address.do_send(Count(msg.0 + 1));
+        MessageResult(TrackableItem::new())
     }
 }
 
@@ -68,7 +67,7 @@ impl Handler<Count> for CounterActor {
 #[should_panic]
 fn test_recursion() {
     let system = actix::System::new("test");
-    let addr: LocalAddress<_> = CounterActor.start();
-    addr.send(Count(0));
+    let addr: Addr<Unsync, _> = CounterActor.start();
+    addr.do_send(Count(0));
     system.run();
 }

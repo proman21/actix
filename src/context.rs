@@ -5,17 +5,8 @@ use tokio_core::reactor::Handle;
 use fut::ActorFuture;
 use actor::{Actor, Supervised,
             ActorState, ActorContext, AsyncContext, SpawnHandle};
-use addr::AddressReceiver;
-use address::Address;
-use local::LocalAddress;
+use address::{SyncAddressReceiver, Addr, Syn, Unsync};
 use contextimpl::ContextImpl;
-
-pub trait AsyncContextAddress<A> where A: Actor, A::Context: AsyncContext<A> {
-
-    fn remote(&mut self) -> Address<A>;
-
-    fn local(&mut self) -> LocalAddress<A>;
-}
 
 /// Actor execution context
 pub struct Context<A> where A: Actor<Context=Context<A>> {
@@ -61,23 +52,35 @@ impl<A> AsyncContext<A> for Context<A> where A: Actor<Context=Self> {
     fn cancel_future(&mut self, handle: SpawnHandle) -> bool {
         self.inner.cancel_future(handle)
     }
-}
 
-#[doc(hidden)]
-impl<A> AsyncContextAddress<A> for Context<A> where A: Actor<Context=Self> {
-
+    #[doc(hidden)]
     #[inline]
-    fn local(&mut self) -> LocalAddress<A> {
-        self.inner.local_address()
+    fn unsync_address(&mut self) -> Addr<Unsync, A> {
+        self.inner.unsync_address()
     }
 
+    #[doc(hidden)]
     #[inline]
-    fn remote(&mut self) -> Address<A> {
-        self.inner.remote_address()
+    fn sync_address(&mut self) -> Addr<Syn, A> {
+        self.inner.sync_address()
     }
 }
 
 impl<A> Context<A> where A: Actor<Context=Self> {
+
+    /// Handle of the running future
+    ///
+    /// SpawnHandle is the handle returned by `AsyncContext::spawn()` method.
+    pub fn handle(&self) -> SpawnHandle {
+        self.inner.curr_handle()
+    }
+
+    /// Set mailbox capacity
+    ///
+    /// By default mailbox capacity is 16 messages.
+    pub fn set_mailbox_capacity(&mut self, cap: usize) {
+        self.inner.set_mailbox_capacity(cap)
+    }
 
     #[inline]
     pub(crate) fn new(act: Option<A>) -> Context<A> {
@@ -85,7 +88,7 @@ impl<A> Context<A> where A: Actor<Context=Self> {
     }
 
     #[inline]
-    pub(crate) fn with_receiver(act: Option<A>, rx: AddressReceiver<A>) -> Context<A> {
+    pub(crate) fn with_receiver(act: Option<A>, rx: SyncAddressReceiver<A>) -> Context<A> {
         Context { inner: ContextImpl::with_receiver(act, rx) }
     }
 
@@ -95,31 +98,16 @@ impl<A> Context<A> where A: Actor<Context=Self> {
     }
 
     #[inline]
-    pub(crate) fn is_alive(&self) -> bool {
-        self.inner.alive()
-    }
-
-    #[inline]
-    pub(crate) fn restarting(&mut self) where A: Supervised {
+    pub(crate) fn restart(&mut self) -> bool where A: Supervised {
         let ctx: &mut Context<A> = unsafe {
             mem::transmute(self as &mut Context<A>)
         };
-        self.inner.actor().restarting(ctx);
-    }
-
-    #[inline]
-    pub(crate) fn actor(&mut self) -> &mut A {
-        self.inner.actor()
+        self.inner.restart(ctx)
     }
 
     #[inline]
     pub(crate) fn set_actor(&mut self, act: A) {
         self.inner.set_actor(act)
-    }
-
-    #[inline]
-    pub(crate) fn into_inner(self) -> A {
-        self.inner.into_inner().unwrap()
     }
 }
 

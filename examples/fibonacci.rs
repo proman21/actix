@@ -9,9 +9,8 @@ use actix::prelude::*;
 
 struct Fibonacci(pub u32);
 
-impl ResponseType for Fibonacci {
-    type Item = u64;
-    type Error = ();
+impl Message for Fibonacci {
+    type Result = Result<u64, ()>;
 }
 
 
@@ -22,7 +21,7 @@ impl Actor for SyncActor {
 }
 
 impl Handler<Fibonacci> for SyncActor {
-    type Result = MessageResult<Fibonacci>;
+    type Result = Result<u64, ()>;
 
     fn handle(&mut self, msg: Fibonacci, _: &mut Self::Context) -> Self::Result {
         if msg.0 == 0 {
@@ -53,11 +52,11 @@ fn main() {
 
     // send 5 messages
     for n in 5..10 {
-        addr.send(Fibonacci(n));
+        addr.do_send(Fibonacci(n));
     }
 
     Arbiter::handle().spawn_fn(|| {
-        Arbiter::system().send(actix::msgs::SystemExit(0));
+        Arbiter::system().do_send(actix::msgs::SystemExit(0));
         futures::future::result(Ok(()))
     });
 

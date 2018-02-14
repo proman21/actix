@@ -7,7 +7,7 @@ extern crate actix_derive;
 
 use std::io;
 use actix_derive::{msg, actor};
-use actix::{msgs, Actor, Address, Arbiter, System};
+use actix::{msgs, Actor, SyncAddress, Arbiter, System};
 use futures::{future, Future};
 
 #[msg(usize)]
@@ -43,7 +43,7 @@ impl SumActor {
 #[test]
 fn test_handlers() {
     let system = System::new("test");
-    let addr: Address<_> = SumActor.start();
+    let addr: SyncAddress<_> = SumActor.start();
 
     system.handle().spawn(addr.call_fut(Sum{a: 10, b: 5}).then(|res| {
         match res {
@@ -59,7 +59,7 @@ fn test_handlers() {
             _ => panic!("Something went wrong"),
         }
 
-        Arbiter::system().send(msgs::SystemExit(0));
+        Arbiter::system().do_send(msgs::SystemExit(0));
         future::result(Ok(()))
     }));
 

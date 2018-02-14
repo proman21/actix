@@ -15,6 +15,7 @@ use std::net;
 use std::str::FromStr;
 use futures::Stream;
 use tokio_io::AsyncRead;
+use tokio_io::codec::FramedRead;
 use tokio_core::net::{TcpListener, TcpStream};
 use actix::prelude::*;
 
@@ -30,7 +31,7 @@ use session::ChatSession;
 /// Define tcp server that will accept incoming tcp connection and create
 /// chat actors.
 struct Server {
-    chat: Address<ChatServer>,
+    chat: Addr<Unsync, ChatServer>,
 }
 
 /// Make actor from `Server`
@@ -52,9 +53,12 @@ impl Handler<TcpConnect> for Server {
         // For each incoming connection we create `ChatSession` actor
         // with out chat server address.
         let server = self.chat.clone();
-        let _: () = ChatSession::create_with(msg.0.framed(ChatCodec), |_, framed| {
-            ChatSession::new(server, framed)
-        });
+        let _: () = ChatSession::create(
+            move |ctx| {
+                let (r, w) = msg.0.split();
+                ChatSession::add_stream(FramedRead::new(r, ChatCodec), ctx);
+                ChatSession::new(server, actix::io::FramedWrite::new(w, ChatCodec, ctx))
+            });
     }
 }
 
@@ -63,7 +67,7 @@ fn main() {
     let sys = actix::System::new("chat-server");
 
     // Start chat server actor
-    let server: Address<_> = ChatServer::default().start();
+    let server: Addr<Unsync, _> = ChatServer::default().start();
 
     // Create server listener
     let addr = net::SocketAddr::from_str("127.0.0.1:12345").unwrap();

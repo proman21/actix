@@ -1,6 +1,6 @@
 # Actix [![Build Status](https://travis-ci.org/actix/actix.svg?branch=master)](https://travis-ci.org/actix/actix) [![Build status](https://ci.appveyor.com/api/projects/status/aytxo1w6a88x2cxk/branch/master?svg=true)](https://ci.appveyor.com/project/fafhrd91/actix-n9e64/branch/master) [![codecov](https://codecov.io/gh/actix/actix/branch/master/graph/badge.svg)](https://codecov.io/gh/actix/actix) [![crates.io](http://meritbadge.herokuapp.com/actix)](https://crates.io/crates/actix) [![Join the chat at https://gitter.im/actix/actix](https://badges.gitter.im/actix/actix.svg)](https://gitter.im/actix/actix?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
-Actix is a rust actor framework.
+Actix is a Rust actor framework.
 
 * [API Documentation (Development)](http://actix.github.io/actix/actix/)
 * [API Documentation (Releases)](https://docs.rs/actix/)
@@ -12,7 +12,7 @@ Actix is a rust actor framework.
 
   * Async/Sync actors.
   * Actor communication in a local/thread context.
-  * Using Futures for asynchronous message handling.
+  * Uses [Futures](https://crates.io/crates/futures) for asynchronous message handling.
   * HTTP1/HTTP2 support ([actix-web](https://github.com/actix/actix-web))
   * Actor supervision.
   * Typed messages (No `Any` type).
@@ -27,9 +27,9 @@ To use `actix`, add this to your `Cargo.toml`:
 actix = "0.4"
 ```
 
-### Initialize the Actix
+### Initialize Actix
 
-In order to use actix you first need to create an `System`.
+In order to use actix you first need to create a `System`.
 
 ```rust,ignore
 extern crate actix;
@@ -41,12 +41,12 @@ fn main() {
 }
 ```
 
-Actix uses [tokio](https://github.com/tokio-rs/tokio-core) event loop. 
-`System::new()` call creates new event loop and starts `System` actor.
-`system.run()` starts tokio event loop and will finish once the `System` actor 
-receives `SystemExit` message.
+Actix uses the [tokio](https://github.com/tokio-rs/tokio-core) event loop. 
+`System::new()` creates a new event loop and starts the `System` actor.
+`system.run()` starts the tokio event loop, and will finish once the `System` actor 
+receives the `SystemExit` message.
 
-Let's create simple Actor.
+Let's create a simple Actor.
 
 ### Implement an Actor
 
@@ -56,7 +56,7 @@ the [`Actor`](https://actix.github.io/actix/actix/trait.Actor.html) trait.
 
 ```rust
 extern crate actix;
-use actix::{msgs, Actor, Address, Arbiter, Context, System};
+use actix::{msgs, Actor, Addr, Arbiter, Context, Syn, System};
 
 struct MyActor;
 
@@ -65,32 +65,32 @@ impl Actor for MyActor {
 
     fn started(&mut self, ctx: &mut Self::Context) {
        println!("I am alive!");
-       Arbiter::system().send(msgs::SystemExit(0));
+       Arbiter::system().do_send(msgs::SystemExit(0));
     }
 }
 
 fn main() {
     let system = System::new("test");
 
-    let addr: Address<_> = MyActor.start();
+    let addr: Addr<Syn, _> = MyActor.start();
 
     system.run();
 }
 ```
 
 Spawning a new actor is achieved via the `start` and `create` methods of
-[Actor](https://actix.github.io/actix/actix/trait.Actor.html) 
+the [Actor](https://actix.github.io/actix/actix/trait.Actor.html) 
 trait. It provides several different ways of creating actors, for details check docs. 
-You can implement `started`, `stopping` and `stopped`mthods of Actor trait, 
-`started` method get called when actor starts and `stopping` when actor finishes.
-Check [api documentation](https://actix.github.io/actix/actix/trait.Actor.html#actor-lifecycle) 
-for more information on actor lifecycle.
+You can implement `started`, `stopping` and `stopped` methods of the Actor trait. 
+`started` gets called when actor starts and `stopping` when actor finishes.
+Check [API documentation](https://actix.github.io/actix/actix/trait.Actor.html#actor-lifecycle) 
+for more information on the actor lifecycle.
 
 ### Handle messages
 
-An Actor communicates with another Actor by sending an messages. In actix all messages are typed.
-Let's define simple `Sum` message with two `usize` parameters and actor which will
-accept this message and return sum of those two numbers.
+An Actor communicates with another Actor by sending messages. In actix all messages are typed.
+Let's define a simple `Sum` message with two `usize` parameters, and an actor which will
+accept this message and return the sum of those two numbers.
 
 ```rust
 extern crate actix;
@@ -101,10 +101,9 @@ use actix::*;
 // this is our Message
 struct Sum(usize, usize);
 
-// we have to define type of response for `Sum` message
-impl ResponseType for Sum {
-    type Item = usize;
-    type Error = ();
+// we have to define the response type for `Sum` message
+impl Message for Sum {
+    type Result = usize;
 }
 
 // Actor definition
@@ -114,12 +113,12 @@ impl Actor for Summator {
     type Context = Context<Self>;
 }
 
-// now we need to define `MessageHandler` for `Sum` message.
+// now we need to define `MessageHandler` for the `Sum` message.
 impl Handler<Sum> for Summator {
-    type Result = Result<usize, ()>;   // <- Message response type
+    type Result = usize;   // <- Message response type
 
     fn handle(&mut self, msg: Sum, ctx: &mut Context<Self>) -> Self::Result {
-        Ok(msg.0 + msg.1)
+        msg.0 + msg.1
     }
 }
 
@@ -128,18 +127,15 @@ fn main() {
 
     let addr: Address<_> = Summator.start();
 
-    // Address<A>::call() returns ActorFuture object, so we need to wait for result.
-    // ActorFuture makes sense within Actor execution context, but we can use
-    // Address<A>::call_fut() which return simple Future object.
-    let res = addr.call_fut(Sum(10, 5));
+    let res = addr.send(Sum(10, 5));  // <- send message and get future for result
     
     system.handle().spawn(res.then(|res| {
         match res {
-            Ok(Ok(result)) => println!("SUM: {}", result),
+            Ok(result) => println!("SUM: {}", result),
             _ => println!("Something wrong"),
         }
         
-        Arbiter::system().send(msgs::SystemExit(0));
+        Arbiter::system().do_send(msgs::SystemExit(0));
         future::result(Ok(()))
     }));
 
@@ -147,25 +143,23 @@ fn main() {
 }
 ```
 
-All communications with actors go through `Address` object. You can `send` message
-without waiting response or `call` actor with specific message. `ResponseType`
-trait defines response type for a message, `Item` and `Error` for value and error respectevily.
-There are different types of addresses.
-[`Address<A>`](https://actix.github.io/actix/actix/struct.Address.html) is an address
-of an actor that runs in same arbiter (event loop). If actor is running in different
-thread [`SyncAddress<A>`](https://actix.github.io/actix/actix/struct.SyncAddress.html)
+All communications with actors go through an `Addr` object. You can `send` a message
+without waiting for a response, or `call` an actor with specific message. The `Message`
+trait defines the result type for a message. There are different types of addresses.
+[`Unsync`](https://actix.github.io/actix/actix/struct.Unsync.html) is an address
+of an actor that runs in the same arbiter (event loop). If an actor is running in a different
+thread, [`Syn`](https://actix.github.io/actix/actix/struct.Syn.html)
 has to be used.
 
-### Actor state and subscription for specific message
+### Actor state and subscription for specific messages
 
-If you noticed, methods of `Actor` and `Handler` traits accept `&mut self`, so you are welcome to 
-store anything in an actor and mutate it whenever you need.
+You may have noticed that methods of `Actor` and `Handler` traits accept `&mut self`, so you are
+welcome to store anything in an actor and mutate it whenever necessary.
 
-Address object requires actor type, but if we just want to send specific message to 
-an actor that can handle message, we can use `Subscriber` interface. Let's create
-new actor that uses `Subscriber`, also this example will show how to use standard future objects.
-Also in this example we are going to use unstable `proc_macro` rust's feature for message
-and handler definitions
+Address objects require an actor type, but if we just want to send a specific message to 
+an actor that can handle the message, we can use the `Subscriber` interface. Let's create
+a new actor that uses `Subscriber`. This example will also show how to use standard future objects.
+We will use Rust's unstable `proc_macro` feature for message and handler definitions.
 
 ```rust,ignore
 #![feature(proc_macro)]
@@ -192,13 +186,13 @@ impl Game {
         self.counter += 1;
         
         if self.counter > 10 {
-            Arbiter::system().send(msgs::SystemExit(0));
+            Arbiter::system().do_send(msgs::SystemExit(0));
         } else {
             println!("Ping received {:?}", id);
             
             // wait 100 nanos
             ctx.run_later(Duration::new(0, 100), move |act, _| {
-                act.addr.send(Ping{id: id + 1});
+                act.addr.do_send(Ping{id: id + 1});
             });
         }
     }
@@ -207,15 +201,15 @@ impl Game {
 fn main() {
     let system = System::new("test");
 
-    // we need Subscriber object so we need to use different builder method
-    // which will allow to postpone actor creation
-    let _: Address<_> = Game::create(|ctx| {
-        // now we can get address of first actor and create second actor
-        let addr: Address<_> = ctx.address();
-        let addr2: Address<_> = Game{counter: 0, addr: addr.subscriber()}.start();
+    // To get a Subscriber object, we need to use a different builder method
+    // which will allow postponing actor creation
+    let _: Addr<Unsync, _> = Game::create(|ctx| {
+        // now we can get an address of the first actor and create the second actor
+        let addr: Addr<Unsync, _> = ctx.address();
+        let addr2: Addr<Unsync, _> = Game{counter: 0, addr: addr.subscriber()}.start();
         
-        // lets start pings
-        addr2.send(Ping{id: 10});
+        // let's start pings
+        addr2.do_send(Ping{id: 10});
         
         // now we can finally create first actor
         Game{counter: 0, addr: addr2.subscriber()}
@@ -225,25 +219,25 @@ fn main() {
 }
 ```
 
-More information on signals handling is in
+More information on signal handling is in the
 [signal](https://actix.github.io/actix/actix/actors/signal/index.html) module.
 
 
 ### chat example
 
-You may consider to check 
-[chat example](https://github.com/actix/actix/tree/master/examples/chat). 
-It provides basic example of networking client/server service.
+There is a
+[chat example](https://github.com/actix/actix/tree/master/examples/chat) 
+which provides a basic example of networking client/server service.
 
 
 ### fectl
 
-You may consider to check [fectl](https://github.com/fafhrd91/fectl) utility. It is written
+You may consider checking out [fectl](https://github.com/fafhrd91/fectl) utility. It is written
 with `actix` and shows how to create networking application with relatively complex interactions.
 
 ## Contributing
 
-All contribution are welcome, if you have a feature request don't hesitate to open an issue!
+All contributions are welcome, if you have a feature request don't hesitate to open an issue!
 
 ## License
 

@@ -29,7 +29,8 @@ default = []
 members = ["examples/chat"]
 
 [dependencies]
-actix_derive = "0.1"
+# actix_derive = "0.2"
+actix_derive = { git = "https://github.com/actix/actix-derive.git" }
 
 # io
 bytes = "0.4"
@@ -48,7 +49,7 @@ libc = { version = "0.2" }
 uuid = { version = "0.5", features = ["v4"] }
 
 # dns
-trust-dns-resolver = "0.7"
+trust-dns-resolver = "0.8"
 
 [dev-dependencies]
 skeptic = "0.13"

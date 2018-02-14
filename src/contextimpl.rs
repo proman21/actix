@@ -4,13 +4,10 @@ use futures::{Async, Poll};
 use smallvec::SmallVec;
 
 use fut::ActorFuture;
-use addr::AddressReceiver;
-use actor::{Actor, AsyncContext, ActorState, SpawnHandle};
-use address::{Address, LocalAddress, Subscriber};
-use context::AsyncContextAddress;
+use actor::{Actor, AsyncContext, ActorState, SpawnHandle, Supervised};
+use address::{Addr, SyncAddressReceiver, Syn, Unsync};
 use contextitems::ActorWaitItem;
-use contextaddress::ContextAddress;
-use handler::{Handler, ResponseType};
+use mailbox::Mailbox;
 
 /// internal context state
 bitflags! {
@@ -31,13 +28,14 @@ type Item<A> = (SpawnHandle, Box<ActorFuture<Item=(), Error=(), Actor=A>>);
 pub struct ContextImpl<A> where A: Actor, A::Context: AsyncContext<A> {
     act: Option<A>,
     flags: ContextFlags,
-    address: ContextAddress<A>,
+    mailbox: Mailbox<A>,
     wait: SmallVec<[ActorWaitItem<A>; 2]>,
     items: SmallVec<[Item<A>; 3]>,
     handle: SpawnHandle,
+    curr_handle: SpawnHandle,
 }
 
-impl<A> ContextImpl<A> where A: Actor, A::Context: AsyncContext<A> + AsyncContextAddress<A>
+impl<A> ContextImpl<A> where A: Actor, A::Context: AsyncContext<A>
 {
     #[inline]
     pub fn new(act: Option<A>) -> ContextImpl<A> {
@@ -46,20 +44,22 @@ impl<A> ContextImpl<A> where A: Actor, A::Context: AsyncContext<A> + AsyncContex
             wait: SmallVec::new(),
             items: SmallVec::new(),
             flags: ContextFlags::RUNNING,
+            mailbox: Mailbox::default(),
             handle: SpawnHandle::default(),
-            address: ContextAddress::default(),
+            curr_handle: SpawnHandle::default(),
         }
     }
 
     #[inline]
-    pub fn with_receiver(act: Option<A>, rx: AddressReceiver<A>) -> Self {
+    pub fn with_receiver(act: Option<A>, rx: SyncAddressReceiver<A>) -> Self {
         ContextImpl {
             act: act,
             wait: SmallVec::new(),
             items: SmallVec::new(),
             flags: ContextFlags::RUNNING,
+            mailbox: Mailbox::new(rx),
             handle: SpawnHandle::default(),
-            address: ContextAddress::new(rx),
+            curr_handle: SpawnHandle::default(),
         }
     }
 
@@ -116,11 +116,17 @@ impl<A> ContextImpl<A> where A: Actor, A::Context: AsyncContext<A> + AsyncContex
     }
 
     #[inline]
+    /// Handle of the running future
+    pub fn curr_handle(&self) -> SpawnHandle {
+        self.curr_handle
+    }
+
+    #[inline]
     /// Spawn new future to this context.
     pub fn spawn<F>(&mut self, fut: F) -> SpawnHandle
         where F: ActorFuture<Item=(), Error=(), Actor=A> + 'static
     {
-        self.flags.insert(ContextFlags::MODIFIED);
+        self.modify();
         self.handle = self.handle.next();
         let fut: Box<ActorFuture<Item=(), Error=(), Actor=A>> = Box::new(fut);
         self.items.push((self.handle, fut));
@@ -132,8 +138,8 @@ impl<A> ContextImpl<A> where A: Actor, A::Context: AsyncContext<A> + AsyncContex
     ///
     /// During wait period actor does not receive any messages.
     pub fn wait<F>(&mut self, f: F) where F: ActorFuture<Item=(), Error=(), Actor=A> + 'static {
+        self.modify();
         self.wait.push(ActorWaitItem::new(f));
-        self.flags.insert(ContextFlags::MODIFIED);
     }
 
     #[inline]
@@ -141,7 +147,7 @@ impl<A> ContextImpl<A> where A: Actor, A::Context: AsyncContext<A> + AsyncContex
     pub fn cancel_future(&mut self, handle: SpawnHandle) -> bool {
         for idx in 0..self.items.len() {
             if self.items[idx].0 == handle {
-                self.flags.insert(ContextFlags::MODIFIED);
+                self.modify();
                 self.items.swap_remove(idx);
                 return true
             }
@@ -150,31 +156,26 @@ impl<A> ContextImpl<A> where A: Actor, A::Context: AsyncContext<A> + AsyncContex
     }
 
     #[inline]
-    pub fn local_address(&mut self) -> LocalAddress<A> {
-        self.modify();
-        self.address.local_address()
+    pub fn capacity(&mut self) -> usize {
+        self.mailbox.capacity()
     }
 
     #[inline]
-    pub fn remote_address(&mut self) -> Address<A> {
+    pub fn set_mailbox_capacity(&mut self, cap: usize) {
         self.modify();
-        self.address.remote_address()
+        self.mailbox.set_capacity(cap);
     }
 
     #[inline]
-    pub fn subscriber<M>(&mut self) -> Box<Subscriber<M>>
-        where A: Handler<M>,
-              M: ResponseType + 'static {
+    pub fn unsync_address(&mut self) -> Addr<Unsync, A> {
         self.modify();
-        Box::new(self.address.local_address())
+        self.mailbox.unsync_address()
     }
 
     #[inline]
-    pub fn remote_subscriber<M>(&mut self) -> Box<Subscriber<M> + Send>
-        where A: Handler<M>,
-              M: ResponseType + Send + 'static, M::Item: Send, M::Error: Send {
+    pub fn sync_address(&mut self) -> Addr<Syn, A> {
         self.modify();
-        Box::new(self.address.remote_address())
+        self.mailbox.remote_address()
     }
 
     #[inline]
@@ -182,13 +183,28 @@ impl<A> ContextImpl<A> where A: Actor, A::Context: AsyncContext<A> + AsyncContex
         if self.flags.intersects(ContextFlags::STOPPING | ContextFlags::STOPPED) {
             false
         } else {
-            self.address.connected() || !self.items.is_empty() || !self.wait.is_empty()
+            self.mailbox.connected() || !self.items.is_empty() || !self.wait.is_empty()
         }
     }
 
     #[inline]
     fn stopping(&self) -> bool {
         self.flags.intersects(ContextFlags::STOPPING | ContextFlags::STOPPED)
+    }
+
+    /// Restart context. Cleanup all futures, except address queue.
+    #[inline]
+    pub fn restart(&mut self, ctx: &mut A::Context) -> bool where A: Supervised {
+        if self.act.is_none() || !self.mailbox.connected() {
+            false
+        } else {
+            self.flags = ContextFlags::RUNNING;
+            self.wait = SmallVec::new();
+            self.items = SmallVec::new();
+            self.handle = SpawnHandle::default();
+            self.actor().restarting(ctx);
+            true
+        }
     }
 
     #[inline]
@@ -222,16 +238,21 @@ impl<A> ContextImpl<A> where A: Actor, A::Context: AsyncContext<A> + AsyncContex
         'outer: loop {
             self.flags.remove(ContextFlags::MODIFIED);
 
-            // check wait futures
+            // check wait futures. order does matter
+            // ctx.wait() always add to the back of the list
+            // and we always have to check most recent future
             while !self.wait.is_empty() && !self.stopping() {
-                match self.wait[0].poll(act, ctx) {
-                    Async::Ready(_) => { self.wait.swap_remove(0); },
-                    Async::NotReady => return Ok(Async::NotReady),
+                if let Some(item) = self.wait.last_mut() {
+                    match item.poll(act, ctx) {
+                        Async::Ready(_) => (),
+                        Async::NotReady => return Ok(Async::NotReady),
+                    }
                 }
+                self.wait.pop();
             }
 
-            // process address
-            self.address.poll(act, ctx);
+            // process mailbox
+            self.mailbox.poll(act, ctx);
             if !self.wait.is_empty() && !self.stopping() {
                 continue
             }
@@ -239,6 +260,7 @@ impl<A> ContextImpl<A> where A: Actor, A::Context: AsyncContext<A> + AsyncContex
             // process items
             let mut idx = 0;
             while idx < self.items.len() && !self.stopping() {
+                self.curr_handle = self.items[idx].0;
                 match self.items[idx].1.poll(act, ctx) {
                     Ok(Async::NotReady) => {
                         // item scheduled wait future
@@ -264,6 +286,7 @@ impl<A> ContextImpl<A> where A: Actor, A::Context: AsyncContext<A> + AsyncContex
                     },
                 }
             }
+            self.curr_handle = SpawnHandle::default();
 
             // ContextFlags::MODIFIED indicates that new IO item has
             // been added during poll process

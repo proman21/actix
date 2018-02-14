@@ -25,18 +25,18 @@
 //!         match msg.0 {
 //!             signal::SignalType::Int => {
 //!                 println!("SIGINT received, exiting");
-//!                 Arbiter::system().send(actix::msgs::SystemExit(0));
+//!                 Arbiter::system().do_send(actix::msgs::SystemExit(0));
 //!             },
 //!             signal::SignalType::Hup => {
 //!                 println!("SIGHUP received, reloading");
 //!             },
 //!             signal::SignalType::Term => {
 //!                 println!("SIGTERM received, stopping");
-//!                 Arbiter::system().send(actix::msgs::SystemExit(0));
+//!                 Arbiter::system().do_send(actix::msgs::SystemExit(0));
 //!             },
 //!             signal::SignalType::Quit => {
 //!                 println!("SIGQUIT received, exiting");
-//!                 Arbiter::system().send(actix::msgs::SystemExit(0));
+//!                 Arbiter::system().do_send(actix::msgs::SystemExit(0));
 //!             }
 //!             _ => (),
 //!         }
@@ -48,12 +48,12 @@
 //!    let sys = System::new("test");
 //!
 //!    // Start signals handler
-//!    let addr: Address<_> = Signals.start();
+//!    let addr: Addr<Syn, _> = Signals.start();
 //!
 //!    // send SIGTERM
 //!    std::thread::spawn(move || {
 //!       // emulate SIGNTERM
-//!       addr.send(signal::Signal(signal::SignalType::Term));
+//!       addr.do_send(signal::Signal(signal::SignalType::Term));
 //!    });
 //!
 //!    // Run system, this function blocks until system runs
@@ -62,7 +62,6 @@
 //! }
 //! ```
 use std;
-use std::io;
 use libc;
 use futures::{Future, Stream};
 use tokio_signal;
@@ -86,22 +85,20 @@ pub enum SignalType {
     Child,
 }
 
-impl ResponseType for SignalType {
-    type Item = ();
-    type Error = ();
+impl Message for SignalType {
+    type Result = ();
 }
 
 /// Process signal message
 pub struct Signal(pub SignalType);
 
-impl ResponseType for Signal {
-    type Item = ();
-    type Error = ();
+impl Message for Signal {
+    type Result = ();
 }
 
 /// An actor implementation of Unix signal handling
 pub struct ProcessSignals {
-    subscribers: Vec<Box<actix::Subscriber<Signal>>>,
+    subscribers: Vec<Recipient<Syn, Signal>>,
 }
 
 impl Default for ProcessSignals {
@@ -125,69 +122,62 @@ impl actix::SystemService for ProcessSignals {
         tokio_signal::ctrl_c(handle).map_err(|_| ())
             .actfuture()
             .map(|sig, _: &mut Self, ctx: &mut actix::Context<Self>|
-                 ctx.add_stream(sig.map(|_| SignalType::Int)))
+                 ctx.add_message_stream(sig.map_err(|_| ()).map(|_| SignalType::Int)))
             .spawn(ctx);
 
         #[cfg(unix)]
         {
             // SIGHUP
-            unix::Signal::new(libc::SIGHUP, handle).map_err(|_| ())
+            unix::Signal::new(libc::SIGHUP, handle)
                 .actfuture()
+                .drop_err()
                 .map(|sig, _: &mut Self, ctx: &mut actix::Context<Self>|
-                     ctx.add_stream(sig.map(|_| SignalType::Hup)))
+                     ctx.add_message_stream(sig.map_err(|_| ()).map(|_| SignalType::Hup)))
                 .spawn(ctx);
 
             // SIGTERM
             unix::Signal::new(libc::SIGTERM, handle).map_err(|_| ())
                 .actfuture()
                 .map(|sig, _: &mut Self, ctx: &mut actix::Context<Self>|
-                     ctx.add_stream(sig.map(|_| SignalType::Term)))
+                     ctx.add_message_stream(sig.map_err(|_| ()).map(|_| SignalType::Term)))
                 .spawn(ctx);
 
             // SIGQUIT
             unix::Signal::new(libc::SIGQUIT, handle).map_err(|_| ())
                 .actfuture()
                 .map(|sig, _: &mut Self, ctx: &mut actix::Context<Self>|
-                     ctx.add_stream(sig.map(|_| SignalType::Quit)))
+                     ctx.add_message_stream(sig.map_err(|_| ()).map(|_| SignalType::Quit)))
                 .spawn(ctx);
 
             // SIGCHLD
             unix::Signal::new(libc::SIGCHLD, handle).map_err(|_| ())
                 .actfuture()
                 .map(|sig, _: &mut Self, ctx: &mut actix::Context<Self>|
-                     ctx.add_stream(sig.map(|_| SignalType::Child)))
+                     ctx.add_message_stream(sig.map_err(|_| ()).map(|_| SignalType::Child)))
                 .spawn(ctx);
         }
     }
 }
 
 #[doc(hidden)]
-impl Handler<io::Result<SignalType>> for ProcessSignals {
+impl Handler<SignalType> for ProcessSignals {
     type Result = ();
 
-    fn handle(&mut self, msg: io::Result<SignalType>, _: &mut Self::Context) {
-        match msg {
-            Ok(sig) => {
-                let subscribers = std::mem::replace(&mut self.subscribers, Vec::new());
-                for subscr in subscribers {
-                    if subscr.send(Signal(sig)).is_ok() {
-                        self.subscribers.push(subscr);
-                    }
-                }
-            },
-            Err(err) => {
-                error!("Error during signal handling: {}", err);
+    fn handle(&mut self, sig: SignalType, _: &mut Self::Context) {
+        let subscribers = std::mem::replace(&mut self.subscribers, Vec::new());
+        for subscr in subscribers {
+            if subscr.do_send(Signal(sig)).is_ok() {
+                self.subscribers.push(subscr);
             }
         }
     }
 }
 
 /// Subscribe to process signals.
-pub struct Subscribe(pub Box<actix::Subscriber<Signal> + Send>);
+pub struct Subscribe(pub Recipient<Syn, Signal>);
 
-impl actix::ResponseType for Subscribe {
-    type Item = ();
-    type Error = ();
+impl Message for Subscribe {
+    type Result = ();
 }
 
 /// Add subscriber for signals
@@ -214,10 +204,11 @@ impl Actor for DefaultSignalsHandler {
 
     fn started(&mut self, ctx: &mut Self::Context) {
         let addr = Arbiter::system_registry().get::<ProcessSignals>();
-        let slf: Address<_> = ctx.address();
-        addr.call(self, Subscribe(slf.subscriber()))
-            .map(|_, _, _| ())
-            .map_err(|_, _, _| ())
+        let slf: Addr<Syn, _> = ctx.address();
+        addr.send(Subscribe(slf.recipient()))
+            .map(|_| ())
+            .map_err(|_| ())
+            .into_actor(self)
             .wait(ctx)
     }
 }
@@ -231,18 +222,18 @@ impl actix::Handler<Signal> for DefaultSignalsHandler {
         match msg.0 {
             SignalType::Int => {
                 info!("SIGINT received, exiting");
-                Arbiter::system().send(actix::msgs::SystemExit(0));
+                Arbiter::system().do_send(actix::msgs::SystemExit(0));
             }
             SignalType::Hup => {
                 info!("SIGHUP received, reloading");
             }
             SignalType::Term => {
                 info!("SIGTERM received, stopping");
-                Arbiter::system().send(actix::msgs::SystemExit(0));
+                Arbiter::system().do_send(actix::msgs::SystemExit(0));
             }
             SignalType::Quit => {
                 info!("SIGQUIT received, exiting");
-                Arbiter::system().send(actix::msgs::SystemExit(0));
+                Arbiter::system().do_send(actix::msgs::SystemExit(0));
             }
             _ => (),
         }

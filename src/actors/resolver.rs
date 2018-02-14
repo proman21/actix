@@ -7,28 +7,28 @@
 //! # extern crate futures;
 //! # use futures::{future, Future};
 //! use actix::prelude::*;
-//! use actix::actors::resolver;
+//! use actix::actors;
 //!
 //! fn main() {
 //!     let sys = System::new("test");
 //!
 //!     Arbiter::handle().spawn({
-//!         let resolver: LocalAddress<_> = Arbiter::registry().get::<resolver::Connector>();
+//!         let resolver: Addr<Unsync, _> = actors::Connector::from_registry();
 //!
-//!         resolver.call_fut(
-//!             resolver::Resolve::host("localhost"))       // <- resolve "localhost"
+//!         resolver.send(
+//!             actors::Resolve::host("localhost"))       // <- resolve "localhost"
 //!                 .then(|addrs| {
 //!                     println!("RESULT: {:?}", addrs);
-//! #                   Arbiter::system().send(actix::msgs::SystemExit(0));
+//! #                   Arbiter::system().do_send(actix::msgs::SystemExit(0));
 //!                     Ok::<_, ()>(())
 //!                 })
 //!    });
 //!
 //!     Arbiter::handle().spawn({
-//!         let resolver: LocalAddress<_> = Arbiter::registry().get::<resolver::Connector>();
+//!         let resolver: Addr<Unsync, _> = actors::Connector::from_registry();
 //!
-//!         resolver.call_fut(
-//!             resolver::Connect::host("localhost:5000"))  // <- connect to a "localhost"
+//!         resolver.send(
+//!             actors::Connect::host("localhost:5000"))  // <- connect to a "localhost"
 //!                 .then(|stream| {
 //!                     println!("RESULT: {:?}", stream);
 //!                     Ok::<_, ()>(())
@@ -67,9 +67,8 @@ impl Resolve {
     }
 }
 
-impl ResponseType for Resolve {
-    type Item = VecDeque<SocketAddr>;
-    type Error = ConnectorError;
+impl Message for Resolve {
+    type Result = Result<VecDeque<SocketAddr>, ConnectorError>;
 }
 
 pub struct Connect {
@@ -86,9 +85,14 @@ impl Connect {
     }
 }
 
-impl ResponseType for Connect {
-    type Item = TcpStream;
-    type Error = ConnectorError;
+impl Message for Connect {
+    type Result = Result<TcpStream, ConnectorError>;
+}
+
+pub struct ConnectAddr(pub SocketAddr);
+
+impl Message for ConnectAddr {
+    type Result = Result<TcpStream, ConnectorError>;
 }
 
 #[derive(Fail, Debug)]
@@ -123,6 +127,8 @@ impl Supervised for Connector {}
 impl actix::ArbiterService for Connector {}
 
 impl Default for Connector {
+
+    #[cfg(unix)]
     fn default() -> Connector {
         let resolver = match ResolverFuture::from_system_conf(Arbiter::handle()) {
             Ok(resolver) => resolver,
@@ -136,10 +142,19 @@ impl Default for Connector {
         };
         Connector{resolver: resolver}
     }
+
+    #[cfg(not(unix))]
+    fn default() -> Connector {
+        let resolver = ResolverFuture::new(
+            ResolverConfig::default(),
+            ResolverOpts::default(),
+            Arbiter::handle());
+        Connector{resolver: resolver}
+    }
 }
 
 impl Handler<Resolve> for Connector {
-    type Result = ResponseFuture<Self, Resolve>;
+    type Result = ResponseActFuture<Self, VecDeque<SocketAddr>, ConnectorError>;
 
     fn handle(&mut self, msg: Resolve, _: &mut Self::Context) -> Self::Result {
         Box::new(Resolver::new(msg.name, msg.port.unwrap_or(0), &self.resolver))
@@ -147,12 +162,22 @@ impl Handler<Resolve> for Connector {
 }
 
 impl Handler<Connect> for Connector {
-    type Result = ResponseFuture<Self, Connect>;
+    type Result = ResponseActFuture<Self, TcpStream, ConnectorError>;
 
     fn handle(&mut self, msg: Connect, _: &mut Self::Context) -> Self::Result {
         Box::new(
             Resolver::new(msg.name, msg.port.unwrap_or(0), &self.resolver)
                 .and_then(|addrs, _, _| TcpConnector::new(addrs)))
+    }
+}
+
+impl Handler<ConnectAddr> for Connector {
+    type Result = ResponseActFuture<Self, TcpStream, ConnectorError>;
+
+    fn handle(&mut self, msg: ConnectAddr, _: &mut Self::Context) -> Self::Result {
+        let mut v = VecDeque::new();
+        v.push_back(msg.0);
+        Box::new(TcpConnector::new(v))
     }
 }
 
@@ -205,9 +230,9 @@ impl Resolver {
         }
 
         // split the string by ':' and convert the second part to u16
-        let mut parts_iter = addr.rsplitn(2, ':');
-        let port_str = try_opt!(parts_iter.next(), "invalid socket address");
+        let mut parts_iter = addr.splitn(2, ':');
         let host = try_opt!(parts_iter.next(), "invalid socket address");
+        let port_str = parts_iter.next().unwrap_or("");
         let port: u16 = port_str.parse().unwrap_or(port);
 
         Ok((host, port))

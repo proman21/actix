@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use tokio_core::reactor::{Core, Handle};
+use futures::Future;
 use futures::sync::oneshot::{channel, Receiver, Sender};
 
 use actor::Actor;
-use address::Address;
+use address::{Addr, Syn};
 use arbiter::Arbiter;
-use handler::{Handler, ResponseType};
+use handler::{Handler, Message};
 use context::Context;
 use msgs::{SystemExit, StopArbiter};
 
@@ -32,7 +33,7 @@ use msgs::{SystemExit, StopArbiter};
 ///    fn started(&mut self, ctx: &mut Context<Self>) {
 ///        ctx.run_later(self.dur, |act, ctx| {
 ///            // send `SystemExit` to `System` actor.
-///            Arbiter::system().send(actix::msgs::SystemExit(0));
+///            Arbiter::system().do_send(actix::msgs::SystemExit(0));
 ///        });
 ///    }
 /// }
@@ -51,7 +52,7 @@ use msgs::{SystemExit, StopArbiter};
 /// ```
 pub struct System {
     stop: Option<Sender<i32>>,
-    arbiters: HashMap<String, Address<Arbiter>>,
+    arbiters: HashMap<String, Addr<Syn, Arbiter>>,
 }
 
 impl Actor for System {
@@ -104,6 +105,12 @@ impl SystemRunner {
             Err(_) => 1,
         }
     }
+
+    pub fn run_until_complete<F, I, E>(&mut self, fut: F) -> Result<I, E>
+        where F: Future<Item=I, Error=E>
+    {
+        self.core.run(fut)
+    }
 }
 
 impl Handler<SystemExit> for System {
@@ -113,7 +120,7 @@ impl Handler<SystemExit> for System {
     {
         // stop arbiters
         for addr in self.arbiters.values() {
-            addr.send(StopArbiter(msg.0));
+            addr.do_send(StopArbiter(msg.0));
         }
         // stop event loop
         if let Some(stop) = self.stop.take() {
@@ -123,12 +130,11 @@ impl Handler<SystemExit> for System {
 }
 
 /// Register Arbiter within system
-pub(crate) struct RegisterArbiter(pub String, pub Address<Arbiter>);
+pub(crate) struct RegisterArbiter(pub String, pub Addr<Syn, Arbiter>);
 
 #[doc(hidden)]
-impl ResponseType for RegisterArbiter {
-    type Item = ();
-    type Error = ();
+impl Message for RegisterArbiter {
+    type Result = ();
 }
 
 #[doc(hidden)]
@@ -144,9 +150,8 @@ impl Handler<RegisterArbiter> for System {
 pub(crate) struct UnregisterArbiter(pub String);
 
 #[doc(hidden)]
-impl ResponseType for UnregisterArbiter {
-    type Item = ();
-    type Error = ();
+impl Message for UnregisterArbiter {
+    type Result = ();
 }
 
 #[doc(hidden)]

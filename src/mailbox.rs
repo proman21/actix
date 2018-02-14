@@ -1,27 +1,28 @@
 use futures::{Async, Stream};
 
 use actor::{Actor, AsyncContext};
-use address::{Address, LocalAddress};
-use local::{LocalAddrReceiver, LocalAddrProtocol};
-use addr::AddressReceiver;
-use addr::channel as sync;
-
+use address::{sync_channel, Addr, Syn, SyncAddressReceiver, Unsync, UnsyncAddrReceiver};
+use address::EnvelopeProxy;
 
 /// Maximum number of consecutive polls in a loop
 const MAX_SYNC_POLLS: u32 = 256;
 
-pub(crate) struct ContextAddress<A> where A: Actor, A::Context: AsyncContext<A> {
-    sync_msgs: Option<AddressReceiver<A>>,
-    unsync_msgs: LocalAddrReceiver<A>,
+/// Default address channel capacity
+pub const DEFAULT_CAPACITY: usize = 16;
+
+
+pub(crate) struct Mailbox<A> where A: Actor, A::Context: AsyncContext<A> {
+    sync_msgs: Option<SyncAddressReceiver<A>>,
+    unsync_msgs: UnsyncAddrReceiver<A>,
 }
 
-impl<A> Default for ContextAddress<A> where A: Actor, A::Context: AsyncContext<A> {
+impl<A> Default for Mailbox<A> where A: Actor, A::Context: AsyncContext<A> {
 
     #[inline]
     fn default() -> Self {
-        ContextAddress {
+        Mailbox {
             sync_msgs: None,
-            unsync_msgs: LocalAddrReceiver::new(0) }
+            unsync_msgs: UnsyncAddrReceiver::new(DEFAULT_CAPACITY) }
     }
 }
 
@@ -34,37 +35,46 @@ impl NumPolls {
     }
 }
 
-impl<A> ContextAddress<A> where A: Actor, A::Context: AsyncContext<A>
+impl<A> Mailbox<A> where A: Actor, A::Context: AsyncContext<A>
 {
     #[inline]
-    pub fn new(rx: AddressReceiver<A>) -> Self {
-        ContextAddress {
+    pub fn new(rx: SyncAddressReceiver<A>) -> Self {
+        Mailbox {
             sync_msgs: Some(rx),
-            unsync_msgs: LocalAddrReceiver::new(0) }
+            unsync_msgs: UnsyncAddrReceiver::new(16) }
     }
 
+    pub fn capacity(&self) -> usize {
+        self.unsync_msgs.capacity()
+    }
+
+    pub fn set_capacity(&mut self, cap: usize) {
+        self.unsync_msgs.set_capacity(cap);
+        self.sync_msgs.as_mut().map(|msgs| msgs.set_capacity(cap));
+    }
+    
     #[inline]
     pub fn connected(&self) -> bool {
         self.unsync_msgs.connected() ||
             self.sync_msgs.as_ref().map(|msgs| msgs.connected()).unwrap_or(false)
     }
 
-    pub fn remote_address(&mut self) -> Address<A> {
+    pub fn remote_address(&mut self) -> Addr<Syn,A> {
         if self.sync_msgs.is_none() {
-            let (tx, rx) = sync::channel(0);
+            let (tx, rx) = sync_channel::channel(self.unsync_msgs.capacity());
             self.sync_msgs = Some(rx);
-            Address::new(tx)
+            Addr::new(tx)
         } else {
             if let Some(ref mut addr) = self.sync_msgs {
-                return Address::new(addr.sender())
+                return Addr::new(addr.sender())
             }
             unreachable!();
         }
     }
 
     #[inline]
-    pub fn local_address(&mut self) -> LocalAddress<A> {
-        LocalAddress::new(self.unsync_msgs.sender())
+    pub fn unsync_address(&mut self) -> Addr<Unsync, A> {
+        Addr::new(self.unsync_msgs.sender())
     }
 
     pub fn poll(&mut self, act: &mut A, ctx: &mut A::Context) {
@@ -77,16 +87,9 @@ impl<A> ContextAddress<A> where A: Actor, A::Context: AsyncContext<A>
                 if ctx.waiting() { return }
 
                 match self.unsync_msgs.poll() {
-                    Ok(Async::Ready(Some(msg))) => {
+                    Ok(Async::Ready(Some(mut msg))) => {
                         not_ready = false;
-                        match msg {
-                            LocalAddrProtocol::Envelope(mut env) => {
-                                env.env.handle(act, ctx)
-                            }
-                            LocalAddrProtocol::Upgrade(tx) => {
-                                let _ = tx.send(self.remote_address());
-                            }
-                        }
+                        msg.handle(act, ctx);
                     }
                     Ok(Async::Ready(None)) | Ok(Async::NotReady) | Err(_) => break,
                 }

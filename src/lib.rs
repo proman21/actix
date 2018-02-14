@@ -3,7 +3,7 @@
 //! [Actors](https://actix.github.io/actix/actix/trait.Actor.html) are objects
 //! which encapsulate state and behavior, they communicate exclusively
 //! by exchanging messages. Actix actors are implemented on top of [Tokio](https://tokio.rs).
-//! Mutiple actors could run in same thread. Actors could run in multiple threads
+//! Multiple actors could run in same thread. Actors could run in multiple threads
 //! with support of [`Arbiter`](https://actix.github.io/actix/actix/struct.Arbiter.html).
 //! Actors exchange typed messages.
 //!
@@ -15,7 +15,7 @@
 //! * HTTP1/HTTP2 support ([actix-web](https://github.com/actix/actix-web))
 //! * Actor supervision.
 //! * Typed messages (No `Any` type). Generic messages are allowed.
-//! * Minimum supported Rust version: 1.20 or later
+//! * Minimum supported Rust version: 1.21 or later
 
 #[macro_use]
 extern crate log;
@@ -51,40 +51,44 @@ mod arbiter;
 mod context;
 mod contextimpl;
 mod contextitems;
-mod envelope;
-mod framed;
 mod handler;
-mod registry;
+mod stream;
 mod system;
 mod supervisor;
 
 mod address;
-mod contextaddress;
-mod addr;
-mod local;
+mod mailbox;
 
+pub mod io;
 pub mod fut;
 pub mod actors;
 pub mod msgs;
 pub mod sync;
 pub mod utils;
+pub mod registry;
 
 pub use fut::{ActorFuture, ActorStream, WrapFuture, WrapStream, FinishStream};
-pub use actor::{Actor, ActorState, FramedActor, Supervised,
-                ActorContext, AsyncContext, SpawnHandle};
-pub use handler::{Handler, Response, ResponseType, MessageResult, ResponseFuture};
+pub use actor::{Actor, ActorState, Supervised,
+                ActorContext, AsyncContext, ErrorAction, SpawnHandle};
+pub use handler::{Handler, Response, ActorResponse,
+                  Message, MessageResult, ResponseFuture, ResponseActFuture};
 pub use arbiter::Arbiter;
-pub use address::{Address, LocalAddress, Subscriber, ActorAddress};
+pub use address::{Addr, Syn, Unsync, ActorAddress, Recipient, MailboxError};
 pub use context::Context;
-pub use envelope::ToEnvelope;
-pub use framed::FramedCell;
+pub use stream::StreamHandler;
 pub use sync::{SyncContext, SyncArbiter};
-pub use registry::{Registry, SystemRegistry, ArbiterService, SystemService};
 pub use system::{System, SystemRunner};
 pub use supervisor::Supervisor;
 
 #[doc(hidden)]
 pub use context::ContextFutureSpawner;
+
+#[doc(hidden)]
+#[deprecated(since="0.5.0", note="Use Addr<Unsync<T>>")]
+pub type Address<T> = Addr<Unsync, T>;
+#[doc(hidden)]
+#[deprecated(since="0.5.0", note="Use Addr<Syn<T>>")]
+pub type SyncAddress<T> = Addr<Syn, T>;
 
 pub mod prelude {
 //! The `actix` prelude
@@ -100,28 +104,33 @@ pub mod prelude {
     #[doc(hidden)]
     pub use actix_derive::*;
 
+    #[doc(hidden)]
+    #[deprecated(since="0.5.0", note="Use Addr<Unsync<T>>")]
+    pub type Address<T> = Addr<Unsync, T>;
+    #[doc(hidden)]
+    #[deprecated(since="0.5.0", note="Use Addr<Syn<T>>")]
+    pub type SyncAddress<T> = Addr<Syn, T>;
+
     pub use fut::{ActorFuture, ActorStream, WrapFuture, WrapStream};
-    pub use actor::{Actor, ActorContext, AsyncContext, FramedActor, Supervised};
+    pub use actor::{Actor, ActorState, ActorContext, AsyncContext,
+                    ErrorAction, Supervised, SpawnHandle};
     pub use arbiter::Arbiter;
-    pub use address::{Address, LocalAddress};
+    pub use address::{Addr, Syn, Unsync, SendError, Recipient, MailboxError};
     pub use context::{Context, ContextFutureSpawner};
-    pub use framed::FramedCell;
-    pub use handler::{Handler, Response, ResponseType, MessageResult, ResponseFuture};
+    pub use registry::{ArbiterService, SystemService};
+    pub use stream::StreamHandler;
+    pub use handler::{Handler, Response, ActorResponse, Message, MessageResult,
+                      ResponseFuture, ResponseActFuture};
     pub use system::System;
     pub use sync::{SyncContext, SyncArbiter};
     pub use supervisor::Supervisor;
 
     pub mod actix {
+        pub use prelude::*;
+        pub use fut;
         pub use msgs;
-        pub use fut::{self, ActorFuture, ActorStream, WrapFuture, WrapStream};
-        pub use actor::{Actor, ActorState, FramedActor, Supervised,
-                        ActorContext, AsyncContext, SpawnHandle};
-        pub use handler::{Handler, Response, ResponseType, MessageResult, ResponseFuture};
-        pub use arbiter::Arbiter;
-        pub use address::{Address, LocalAddress, Subscriber, ActorAddress};
-        pub use context::Context;
-        pub use system::System;
-        pub use sync::{SyncContext, SyncArbiter};
+        pub use io;
+        pub use address::ActorAddress;
         pub use registry::{ArbiterService, SystemService};
         pub use utils::Condition;
     }
@@ -141,11 +150,9 @@ pub mod dev {
     pub use prelude::*;
     pub use prelude::actix::*;
 
-    pub use address::{ActorAddress, SendError};
-    pub use context::AsyncContextAddress;
     pub use contextimpl::ContextImpl;
-    pub use envelope::{Envelope, ToEnvelope, RemoteEnvelope};
-
-    pub use addr::Request;
-    pub use local::{LocalRequest, LocalFutRequest, UpgradeAddress};
+    pub use handler::{MessageResponse, ResponseChannel};
+    pub use address::{ActorAddress, ToEnvelope, SyncEnvelope, Request, RecipientRequest};
+    pub use address::{Destination, MessageDestination, MessageDestinationTransport,
+                      MessageRecipient, MessageRecipientTransport};
 }

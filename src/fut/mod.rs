@@ -1,26 +1,32 @@
 //! Custom `Future` implementation with `Actix` support
 
+use std::time::Duration;
 use std::marker::PhantomData;
 use futures::{Future, Poll, Stream};
 
 mod chain;
 mod and_then;
 mod either;
+mod from_err;
 mod result;
 mod then;
 mod map;
 mod map_err;
+mod timeout;
 mod stream_map;
 mod stream_map_err;
 mod stream_then;
 mod stream_and_then;
 mod stream_finish;
 mod stream_fold;
+mod stream_timeout;
 mod helpers;
 
 pub use self::either::Either;
 pub use self::and_then::AndThen;
+pub use self::from_err::FromErr;
 pub use self::then::Then;
+pub use self::timeout::Timeout;
 pub use self::map::Map;
 pub use self::map_err::{MapErr, DropErr};
 pub use self::result::{result, ok, err, FutureResult};
@@ -30,6 +36,7 @@ pub use self::stream_then::StreamThen;
 pub use self::stream_and_then::StreamAndThen;
 pub use self::stream_finish::StreamFinish;
 pub use self::stream_fold::StreamFold;
+pub use self::stream_timeout::StreamTimeout;
 pub use self::helpers::{Finish, FinishStream};
 
 use actor::Actor;
@@ -77,6 +84,13 @@ pub trait ActorFuture {
         map_err::DropErr::new(self)
     }
 
+    /// Map this future's error to any error implementing `From` for
+    /// this future's `Error`, returning a new future.
+    fn from_err<E:From<Self::Error>>(self) -> FromErr<Self, E> where Self: Sized,
+    {
+        from_err::new(self)
+    }
+
     /// Chain on a computation for when a future finished, passing the result of
     /// the future to the provided closure `f`.
     fn then<F, B>(self, f: F) -> Then<Self, B, F>
@@ -97,6 +111,12 @@ pub trait ActorFuture {
         and_then::new(self, f)
     }
 
+    /// Add timeout to futures chain.
+    ///
+    /// `err` value get returned as a timeout error.
+    fn timeout(self, timeout: Duration, err: Self::Error) -> Timeout<Self> where Self: Sized {
+        timeout::new(self, timeout, err)
+    }
 }
 
 /// A stream of values, not all of which may have been produced yet.
@@ -164,7 +184,16 @@ pub trait ActorStream {
         stream_fold::new(self, f, init)
     }
 
-    /// Converts a stream to a future that resolves when stream completes.
+    /// Add timeout to stream.
+    ///
+    /// `err` value get returned as a timeout error.
+    fn timeout(self, timeout: Duration, err: Self::Error) -> StreamTimeout<Self>
+        where Self: Sized, Self::Error: Clone
+    {
+        stream_timeout::new(self, timeout, err)
+    }
+
+    /// Converts a stream to a future that resolves when stream finishes.
     fn finish(self) -> StreamFinish<Self>
         where Self: Sized
     {
@@ -200,6 +229,17 @@ impl<F: ActorFuture> IntoActorFuture for F {
 
     fn into_future(self) -> F {
         self
+    }
+}
+
+impl<F: ActorFuture + ?Sized> ActorFuture for Box<F> {
+    type Item = F::Item;
+    type Error = F::Error;
+    type Actor = F::Actor;
+
+    fn poll(&mut self, srv: &mut Self::Actor,
+            ctx: &mut <Self::Actor as Actor>::Context) -> Poll<Self::Item, Self::Error> {
+        (**self).poll(srv, ctx)
     }
 }
 
@@ -274,7 +314,11 @@ pub trait WrapStream<A> where A: Actor
     /// The error that the future may resolve with.
     type Error;
 
+    #[doc(hidden)]
     fn actstream(self) -> Self::Stream;
+
+    /// Convert normal stream to a ActorStream
+    fn into_actor(self, a: &A) -> Self::Stream;
 }
 
 impl<S: Stream, A: Actor> WrapStream<A> for S {
@@ -282,7 +326,12 @@ impl<S: Stream, A: Actor> WrapStream<A> for S {
     type Item = S::Item;
     type Error = S::Error;
 
+    #[doc(hidden)]
     fn actstream(self) -> Self::Stream {
+        wrap_stream(self)
+    }
+
+    fn into_actor(self, _: &A) -> Self::Stream {
         wrap_stream(self)
     }
 }

@@ -1,17 +1,13 @@
 use std::time::Duration;
-use futures::{future, Future, Stream};
-use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_io::codec::{Framed, Encoder, Decoder};
+use futures::{future, Stream};
 
 use fut::ActorFuture;
 use arbiter::Arbiter;
-use address::ActorAddress;
-use envelope::ToEnvelope;
-use handler::{Handler, Response, ResponseType};
+use address::{Addr, ActorAddress, Syn, Unsync};
 use context::Context;
-use contextitems::{ActorFutureItem, ActorMessageItem,
-                   ActorDelayedMessageItem, ActorStreamItem, ActorMessageStreamItem};
-use framed::{FramedCell, FramedWrapper};
+use handler::{Handler, Message};
+use stream::StreamHandler;
+use contextitems::{ActorMessageItem, ActorDelayedMessageItem, ActorMessageStreamItem};
 use utils::TimerFunc;
 
 
@@ -25,8 +21,8 @@ use utils::TimerFunc;
 ///
 /// Actors communicate exclusively by exchanging messages. Sender actor can
 /// wait for response. Actors are not referenced directly, but by
-/// non thread safe [`LocalAddress<A>`](struct.LocalAddress.html) or thread safe address
-/// [`Address<A>`](struct.Address.html)
+/// non thread safe [`Addr<Unsync, A>`](struct.Addr.html) or thread safe address
+/// [`Addr<Syn, A>`](struct.Addr.html)
 /// To be able to handle specific message actor has to provide
 /// [`Handler<M>`](trait.Handler.html)
 /// implementation for this message. All messages are statically typed. Message could be
@@ -69,7 +65,7 @@ use utils::TimerFunc;
 pub trait Actor: Sized + 'static {
 
     /// Actor execution context type
-    type Context: ActorContext + ToEnvelope<Self>;
+    type Context: ActorContext;
 
     /// Method is called when actor get polled first time.
     fn started(&mut self, ctx: &mut Self::Context) {}
@@ -104,7 +100,7 @@ pub trait Actor: Sized + 'static {
     ///     type Context = Context<Self>;
     /// }
     ///
-    /// let addr: LocalAddress<_> = MyActor.start();
+    /// let addr: Addr<Unsync, _> = MyActor.start();
     /// ```
     fn start<Addr>(self) -> Addr
         where Self: Actor<Context=Context<Self>> + ActorAddress<Self, Addr>
@@ -137,7 +133,7 @@ pub trait Actor: Sized + 'static {
     ///     type Context = Context<Self>;
     /// }
     ///
-    /// let addr: LocalAddress<_> = MyActor::create(|ctx: &mut Context<MyActor>| {
+    /// let addr: Addr<Unsync, _> = MyActor::create(|ctx: &mut Context<MyActor>| {
     ///     MyActor{val: 10}
     /// });
     /// ```
@@ -154,67 +150,6 @@ pub trait Actor: Sized + 'static {
             ctx.run(Arbiter::handle());
             future::ok(())
         });
-        addr
-    }
-
-    /// Create static response.
-    fn reply<M>(val: Result<M::Item, M::Error>) -> Response<Self, M> where M: ResponseType {
-        Response::reply(val)
-    }
-
-    /// Create async response process.
-    fn async_reply<T, M>(fut: T) -> Response<Self, M>
-        where M: ResponseType,
-              T: ActorFuture<Item=M::Item, Error=M::Error, Actor=Self> + Sized + 'static {
-        Response::async_reply(fut)
-    }
-}
-
-/// Actor trait that allows to handle `tokio_io::codec::Framed` objects.
-#[allow(unused_variables)]
-pub trait FramedActor<Io, Codec>: Actor
-    where Io: AsyncRead + AsyncWrite + 'static,
-          Codec: Encoder + Decoder + 'static,
-{
-    /// This method is called for every decoded message from framed object.
-    fn handle(&mut self,
-              msg: Result<<Codec as Decoder>::Item, <Codec as Decoder>::Error>,
-              ctx: &mut Self::Context);
-
-    /// This method is called when framed object get closed.
-    ///
-    /// `error` indicates if framed get closed because of error.
-    fn closed(&mut self, error: Option<<Codec as Encoder>::Error>,
-              ctx: &mut Self::Context) {}
-
-    /// Add framed object to current context and return
-    /// wrapper for write part of the framed object.
-    fn add_framed(&self, framed: Framed<Io, Codec>, ctx: &mut Self::Context)
-                  -> FramedCell<Io, Codec>
-        where Self::Context: AsyncContext<Self>
-    {
-        let (wrp, cell) = FramedWrapper::new(framed);
-        ctx.spawn(wrp);
-        cell
-    }
-
-    /// Start new asynchronous actor, returns address of newly created actor.
-    fn create_with<Addr, F>(framed: Framed<Io, Codec>, f: F) -> Addr
-        where Self: Actor<Context=Context<Self>> + ActorAddress<Self, Addr>,
-              F: FnOnce(&mut Context<Self>, FramedCell<Io, Codec>) -> Self + 'static
-    {
-        let mut ctx = Context::new(None);
-        let addr =  <Self as ActorAddress<Self, Addr>>::get(&mut ctx);
-        let (wrp, cell) = FramedWrapper::new(framed);
-        ctx.spawn(wrp);
-
-        Arbiter::handle().spawn_fn(move || {
-            let act = f(&mut ctx, cell);
-            ctx.set_actor(act);
-            ctx.run(Arbiter::handle());
-            future::ok(())
-        });
-
         addr
     }
 }
@@ -272,12 +207,20 @@ pub trait ActorContext: Sized {
 }
 
 /// Asynchronous execution context
-pub trait AsyncContext<A>: ActorContext + ToEnvelope<A> where A: Actor<Context=Self>
+pub trait AsyncContext<A>: ActorContext where A: Actor<Context=Self>
 {
     /// Get actor address
     fn address<Address>(&mut self) -> Address where A: ActorAddress<A, Address> {
         <A as ActorAddress<A, Address>>::get(self)
     }
+
+    #[doc(hidden)]
+    /// Return `SyncAddress` of the context
+    fn sync_address(&mut self) -> Addr<Syn, A>;
+
+    #[doc(hidden)]
+    /// Return `Addr<Unsync<_>>` of the context
+    fn unsync_address(&mut self) -> Addr<Unsync, A>;
 
     /// Spawn async future into context. Returns handle of the item,
     /// could be used for cancelling execution.
@@ -297,59 +240,10 @@ pub trait AsyncContext<A>: ActorContext + ToEnvelope<A> where A: Actor<Context=S
     /// Cancel future. idx is a value returned by `spawn` method.
     fn cancel_future(&mut self, handle: SpawnHandle) -> bool;
 
-    /// This method allow to handle Future in similar way as normal actor messages.
-    ///
-    /// ```rust
-    /// # #[macro_use] extern crate actix;
-    /// # extern crate futures;
-    /// use std::io;
-    /// use actix::prelude::*;
-    /// use futures::future;
-    ///
-    /// #[derive(Message)]
-    /// struct Ping;
-    ///
-    /// struct MyActor;
-    ///
-    /// impl Handler<Result<Ping, io::Error>> for MyActor {
-    ///     type Result = ();
-    ///
-    ///     fn handle(&mut self, msg: Result<Ping, io::Error>, ctx: &mut Context<MyActor>) {
-    ///         println!("PING");
-    /// #       Arbiter::system().send(actix::msgs::SystemExit(0));
-    ///     }
-    /// }
-    ///
-    /// impl Actor for MyActor {
-    ///    type Context = Context<Self>;
-    ///
-    ///    fn started(&mut self, ctx: &mut Context<Self>) {
-    ///        // send `Ping` to self.
-    ///        ctx.add_future(future::result::<Ping, io::Error>(Ok(Ping)));
-    ///    }
-    /// }
-    /// # fn main() {
-    /// #    let sys = System::new("example");
-    /// #    let addr: LocalAddress<_> = MyActor.start();
-    /// #    sys.run();
-    /// # }
-    /// ```
-    fn add_future<F>(&mut self, fut: F)
-        where F: Future + 'static,
-              F::Item: ResponseType,
-              A: Handler<Result<F::Item, F::Error>>
-    {
-        if self.state() == ActorState::Stopped {
-            error!("Context::add_future called for stopped actor.");
-        } else {
-            self.spawn(ActorFutureItem::new(fut));
-        }
-    }
-
-    /// This method is similar to `add_future` but works with streams.
+    /// This method allow to handle `Stream` in similar way as normal actor messages.
     ///
     /// Information to consider. Actor wont receive next item from a stream
-    /// until `Response` future resolves to a result. `Self::reply` resolves immediately.
+    /// until `Response` future resolves to a result.
     ///
     /// This method is similar to `add_stream` but it skips result error.
     ///
@@ -365,12 +259,15 @@ pub trait AsyncContext<A>: ActorContext + ToEnvelope<A> where A: Actor<Context=S
     ///
     /// struct MyActor;
     ///
-    /// impl Handler<Result<Ping, io::Error>> for MyActor {
-    ///     type Result = ();
+    /// impl StreamHandler<Ping, io::Error> for MyActor {
     ///
-    ///     fn handle(&mut self, msg: Result<Ping, io::Error>, ctx: &mut Context<MyActor>) {
+    ///     fn handle(&mut self, item: Ping, ctx: &mut Context<MyActor>) {
     ///         println!("PING");
-    /// #       Arbiter::system().send(actix::msgs::SystemExit(0));
+    /// #       Arbiter::system().do_send(actix::msgs::SystemExit(0));
+    ///     }
+    ///
+    ///     fn finished(&mut self, ctx: &mut Self::Context) {
+    ///         println!("finished");
     ///     }
     /// }
     ///
@@ -384,23 +281,18 @@ pub trait AsyncContext<A>: ActorContext + ToEnvelope<A> where A: Actor<Context=S
     /// }
     /// # fn main() {
     /// #    let sys = System::new("example");
-    /// #    let addr: LocalAddress<_> = MyActor.start();
+    /// #    let addr: Addr<Unsync, _> = MyActor.start();
     /// #    sys.run();
     /// # }
     /// ```
-    fn add_stream<S>(&mut self, fut: S)
+    fn add_stream<S>(&mut self, fut: S) -> SpawnHandle
         where S: Stream + 'static,
-              S::Item: ResponseType,
-              A: Handler<Result<S::Item, S::Error>>
+              A: StreamHandler<S::Item, S::Error>,
     {
-        if self.state() == ActorState::Stopped {
-            error!("Context::add_stream called for stopped actor.");
-        } else {
-            self.spawn(ActorStreamItem::new(fut));
-        }
+        <A as StreamHandler<S::Item, S::Error>>::add_stream(fut, self)
     }
 
-    /// This method is similar to `add_stream` but it skips result error.
+    /// This method is similar to `add_stream` but it skips stream errors.
     ///
     /// ```rust
     /// # #[macro_use] extern crate actix;
@@ -418,7 +310,7 @@ pub trait AsyncContext<A>: ActorContext + ToEnvelope<A> where A: Actor<Context=S
     ///
     ///     fn handle(&mut self, msg: Ping, ctx: &mut Context<MyActor>) {
     ///         println!("PING");
-    /// #       Arbiter::system().send(actix::msgs::SystemExit(0));
+    /// #       Arbiter::system().do_send(actix::msgs::SystemExit(0));
     ///     }
     /// }
     ///
@@ -432,13 +324,13 @@ pub trait AsyncContext<A>: ActorContext + ToEnvelope<A> where A: Actor<Context=S
     /// }
     /// # fn main() {
     /// #    let sys = System::new("example");
-    /// #    let addr: LocalAddress<_> = MyActor.start();
+    /// #    let addr: Addr<Unsync, _> = MyActor.start();
     /// #    sys.run();
     /// # }
     /// ```
     fn add_message_stream<S>(&mut self, fut: S)
         where S: Stream<Error=()> + 'static,
-              S::Item: ResponseType,
+              S::Item: Message,
               A: Handler<S::Item>
     {
         if self.state() == ActorState::Stopped {
@@ -450,7 +342,7 @@ pub trait AsyncContext<A>: ActorContext + ToEnvelope<A> where A: Actor<Context=S
 
     /// Send message `msg` to self.
     fn notify<M>(&mut self, msg: M)
-        where A: Handler<M>, M: ResponseType + 'static
+        where A: Handler<M>, M: Message + 'static
     {
         if self.state() == ActorState::Stopped {
             error!("Context::add_timeout called for stopped actor.");
@@ -463,7 +355,7 @@ pub trait AsyncContext<A>: ActorContext + ToEnvelope<A> where A: Actor<Context=S
     /// which could be used for cancellation. Notification get cancelled
     /// if context's stop method get called.
     fn notify_later<M>(&mut self, msg: M, after: Duration) -> SpawnHandle
-        where A: Handler<M>, M: ResponseType + 'static
+        where A: Handler<M>, M: Message + 'static
     {
         if self.state() == ActorState::Stopped {
             error!("Context::add_timeout called for stopped actor.");
@@ -482,6 +374,12 @@ pub trait AsyncContext<A>: ActorContext + ToEnvelope<A> where A: Actor<Context=S
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ErrorAction {
+    Stop,
+    Continue,
+}
+
 /// Spawned future handle. Could be used for cancelling spawned future.
 #[derive(Eq, PartialEq, Debug, Copy, Clone, Hash)]
 pub struct SpawnHandle(usize);
@@ -490,6 +388,10 @@ impl SpawnHandle {
     /// Get next handle
     pub fn next(self) -> SpawnHandle {
         SpawnHandle(self.0 + 1)
+    }
+    #[doc(hidden)]
+    pub fn into_usize(self) -> usize {
+        self.0
     }
 }
 

@@ -15,26 +15,26 @@ impl Actor for SumActor {
 }
 
 impl Handler<Sum> for SumActor {
-    type Result = MessageResult<Sum>;
+    type Result = usize;
 
     fn handle(&mut self, message: Sum, _context: &mut Context<Self>) -> Self::Result {
-        Ok(message.0 + message.1)
+        message.0 + message.1
     }
 }
 
 #[test]
 pub fn response_derive_one() {
     let system = System::new("test");
-    let addr: LocalAddress<_> = SumActor.start();
-    let res = addr.call_fut(Sum(10, 5));
-    
+    let addr: Addr<Unsync, _> = SumActor.start();
+    let res = addr.send(Sum(10, 5));
+
     system.handle().spawn(res.then(|res| {
         match res {
-            Ok(Ok(result)) => assert!(result == 10 + 5),
+            Ok(result) => assert!(result == 10 + 5),
             _ => panic!("Something went wrong"),
         }
-        
-        Arbiter::system().send(actix::msgs::SystemExit(0));
+
+        Arbiter::system().do_send(actix::msgs::SystemExit(0));
         future::result(Ok(()))
     }));
 

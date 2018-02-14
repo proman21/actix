@@ -1,16 +1,24 @@
 # CHANGES
 
-## 0.5.0 (...)
+## 0.5.0 (2018-01-..)
+
+* Address is generic over actor destination
 
 * Drop FramedContext
 
 * Make rules of actor stopping more strict
 
-* Rename Address to LocalAddress, SyncAddress to Address
-
 * Use bounded channels for actor communications
 
 * Add dns resolver and tcp connector utility actor
+
+* Add `StreamHandler` trait for stream handling
+
+* Add `Context::handle()` method, currently runnign future handle
+
+* Add `Sink` implementation for `Subscriber`
+
+* Add `actix::io` helper types for `AsyncWrite` related types
 
 
 ## 0.4.5 (2018-01-23)
